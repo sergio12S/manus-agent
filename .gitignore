@@ -1,0 +1,5 @@
+/target
+*.wallet.enc
+*.agent.db
+*.env
+.DS_Store
