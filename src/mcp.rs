@@ -20,8 +20,21 @@ Transfers are free; swap, stake and unstake include a 0.1% Manus fee that dry_ru
 pub async fn run_stdio(wallet: Arc<AgentWallet>) -> anyhow::Result<()> {
     use tokio::io::{stdin, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    // Each request runs on its own task so a call waiting for Touch ID never blocks
+    // status queries or in-budget payments; one writer keeps responses whole.
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(mut text) = receiver.recv().await {
+            text.push('\n');
+            if stdout.write_all(text.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut lines = BufReader::new(stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    let mut tasks = tokio::task::JoinSet::new();
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
         if line.is_empty() {
@@ -33,12 +46,19 @@ pub async fn run_stdio(wallet: Arc<AgentWallet>) -> anyhow::Result<()> {
         if request.get("id").is_none() {
             continue;
         }
-        let response = handle(&wallet, &request).await;
-        let mut text = serde_json::to_string(&response)?;
-        text.push('\n');
-        stdout.write_all(text.as_bytes()).await?;
-        stdout.flush().await?;
+        let wallet = wallet.clone();
+        let sender = sender.clone();
+        tasks.spawn(async move {
+            let response = handle(&wallet, &request).await;
+            if let Ok(text) = serde_json::to_string(&response) {
+                let _ = sender.send(text);
+            }
+        });
     }
+    // Input closed: let in-flight operations finish and report before exiting.
+    while tasks.join_next().await.is_some() {}
+    drop(sender);
+    let _ = writer.await;
     Ok(())
 }
 

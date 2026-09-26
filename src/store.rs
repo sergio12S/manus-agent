@@ -11,6 +11,10 @@ use super::budget::{Budget, Category, Exposure, SpentToday};
 const COMMITTED_STATUSES: &str =
     "'submitting','submitted','submission_unknown','processed','confirmed','finalized'";
 
+/// An operation waiting for the human reserves its amount, so other calls cannot
+/// spend the same allowance meanwhile. Reservations older than this were interrupted.
+const APPROVAL_RESERVATION_MINUTES: i64 = 10;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: String,
@@ -242,6 +246,21 @@ impl Store {
         Ok(row.and_then(|row| row.get::<Option<String>, _>("blockhash")))
     }
 
+    /// Whether an operation already owns this transaction signature.
+    pub async fn signature_in_use(
+        &self,
+        signature: &str,
+        except_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let row =
+            sqlx::query("SELECT 1 FROM agent_operations WHERE signature = ? AND id != ? LIMIT 1")
+                .bind(signature)
+                .bind(except_id.unwrap_or(""))
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn set_approval(&self, id: &str, approval: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE agent_operations SET approval = ?, updated_at = ? WHERE id = ?")
             .bind(approval)
@@ -281,12 +300,30 @@ impl Store {
         Ok(rows.iter().map(record_from_row).collect())
     }
 
-    /// Committed amounts in the trailing 24 hours, excluding `except_id`.
+    /// Close reservations whose approval wait was interrupted (crash, restart).
+    pub async fn expire_stale_approvals(&self) -> anyhow::Result<u64> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(APPROVAL_RESERVATION_MINUTES))
+            .to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE agent_operations SET status = 'denied', error = 'approval was interrupted',
+                updated_at = ?
+             WHERE status = 'awaiting_approval' AND updated_at < ?",
+        )
+        .bind(now())
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Committed and reserved amounts in the trailing 24 hours, excluding `except_id`.
     pub async fn spent_last_day(&self, except_id: Option<&str>) -> anyhow::Result<SpentToday> {
+        self.expire_stale_approvals().await?;
         let since = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
         let rows = sqlx::query(&format!(
             "SELECT category, sol_out, token_mint, token_out FROM agent_operations
-             WHERE created_at >= ? AND status IN ({COMMITTED_STATUSES}) AND id != ?"
+             WHERE created_at >= ? AND id != ?
+               AND (status IN ({COMMITTED_STATUSES}) OR status = 'awaiting_approval')"
         ))
         .bind(since)
         .bind(except_id.unwrap_or(""))
@@ -389,6 +426,40 @@ mod tests {
         assert_eq!(spent.send_tokens.get("Mint"), Some(&10));
         let spent = store.spent_last_day(Some("a")).await.unwrap();
         assert_eq!(spent.send_sol, 700);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn pending_approvals_reserve_until_interrupted() {
+        let (store, path) = temp_store().await;
+        let exposure = Exposure {
+            category: Category::Send,
+            sol_out: 900,
+            fees: 5_000,
+            token_out: None,
+            recipient: None,
+        };
+        store
+            .insert("wait", None, "h", "send", "s", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .set_evaluation("wait", "s", &exposure, &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .set_status("wait", "awaiting_approval", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.spent_last_day(None).await.unwrap().send_sol, 900);
+
+        // Pretend the wait began long ago, as after a crash.
+        sqlx::query("UPDATE agent_operations SET updated_at = '2000-01-01T00:00:00+00:00'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(store.spent_last_day(None).await.unwrap().send_sol, 0);
+        assert_eq!(store.get("wait").await.unwrap().unwrap().status, "denied");
         let _ = std::fs::remove_file(path);
     }
 

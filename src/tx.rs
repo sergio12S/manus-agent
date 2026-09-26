@@ -291,6 +291,44 @@ pub fn inspect_structure(tx: &VersionedTransaction, wallet: &Pubkey) -> anyhow::
     Ok(())
 }
 
+/// Most lamports the network can charge for `tx`: base fee per signature plus the
+/// priority fee its ComputeBudget instructions request.
+pub fn max_network_fee(tx: &VersionedTransaction) -> u64 {
+    const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
+    const DEFAULT_UNITS_PER_INSTRUCTION: u64 = 200_000;
+    const MAX_UNITS: u64 = 1_400_000;
+    let message = &tx.message;
+    let keys = message.static_account_keys();
+    let compute_budget = Pubkey::from_str(COMPUTE_BUDGET_PROGRAM).expect("compute budget id");
+    let mut unit_limit = None;
+    let mut micro_lamports_per_unit = 0u64;
+    let mut other_instructions = 0u64;
+    for instruction in message.instructions() {
+        if keys.get(instruction.program_id_index as usize) != Some(&compute_budget) {
+            other_instructions += 1;
+            continue;
+        }
+        match instruction.data.split_first() {
+            Some((2, rest)) if rest.len() >= 4 => {
+                unit_limit = Some(u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as u64);
+            }
+            Some((3, rest)) if rest.len() >= 8 => {
+                let mut price = [0u8; 8];
+                price.copy_from_slice(&rest[..8]);
+                micro_lamports_per_unit = u64::from_le_bytes(price);
+            }
+            _ => {}
+        }
+    }
+    let units = unit_limit
+        .unwrap_or(DEFAULT_UNITS_PER_INSTRUCTION.saturating_mul(other_instructions))
+        .min(MAX_UNITS);
+    let priority = (units as u128 * micro_lamports_per_unit as u128).div_ceil(1_000_000);
+    LAMPORTS_PER_SIGNATURE
+        .saturating_mul(message.header().num_required_signatures as u64)
+        .saturating_add(priority.min(u64::MAX as u128) as u64)
+}
+
 /// Net balance changes for the wallet's accounts that simulation observed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SimulatedEffects {
@@ -594,6 +632,28 @@ fn platform_fee_amount(raw: &serde_json::Value, fee_bps: u16) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_fee_bound_reads_compute_budget() {
+        let wallet = Keypair::new();
+        let program = Pubkey::from_str(COMPUTE_BUDGET_PROGRAM).unwrap();
+        let limit = Instruction {
+            program_id: program,
+            accounts: vec![],
+            data: [vec![2u8], 300_000u32.to_le_bytes().to_vec()].concat(),
+        };
+        let price = Instruction {
+            program_id: program,
+            accounts: vec![],
+            data: [vec![3u8], 1_000_000u64.to_le_bytes().to_vec()].concat(),
+        };
+        let transfer = sol_transfer_instructions(&wallet.pubkey(), &Pubkey::new_unique(), 1, None);
+        let with_budget = signed(&[limit, price, transfer[0].clone()], &wallet);
+        // 5,000 base + 300,000 units × 1 lamport.
+        assert_eq!(max_network_fee(&with_budget), 305_000);
+        let plain = signed(&transfer, &wallet);
+        assert_eq!(max_network_fee(&plain), 5_000);
+    }
 
     #[test]
     fn fee_accounts_belong_to_the_fee_wallet() {

@@ -4,7 +4,7 @@
 //!   cargo test --test localnet -- --ignored --test-threads=1
 
 use manus_agent_wallet::{
-    approval::NoApprover,
+    approval::{ApprovalOutcome, Approver, NoApprover},
     budget::{Budget, Limits},
     engine::{AgentWallet, Request},
     gbrain::Gbrain,
@@ -93,7 +93,30 @@ async fn mint_tokens(rpc: &RpcClient, authority: &Keypair, owner: &Pubkey) -> Pu
     mint.pubkey()
 }
 
+/// Approves after a pause, standing in for a human reaching for Touch ID.
+struct SlowApprover(std::time::Duration);
+
+impl Approver for SlowApprover {
+    fn request(&self, _reason: &str) -> ApprovalOutcome {
+        std::thread::sleep(self.0);
+        ApprovalOutcome::Approved {
+            method: "slow-test".into(),
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "slow test approver"
+    }
+}
+
 async fn wallet_with(budget: Budget) -> (Arc<AgentWallet>, std::path::PathBuf) {
+    wallet_with_approver(budget, Arc::new(NoApprover)).await
+}
+
+async fn wallet_with_approver(
+    budget: Budget,
+    approver: Arc<dyn Approver>,
+) -> (Arc<AgentWallet>, std::path::PathBuf) {
     let signer = Keypair::new();
     fund(&rpc(), &signer.pubkey(), 5_000_000_000).await;
     let path = std::env::temp_dir().join(format!("agent-localnet-{}.db", uuid::Uuid::new_v4()));
@@ -104,7 +127,7 @@ async fn wallet_with(budget: Budget) -> (Arc<AgentWallet>, std::path::PathBuf) {
         signer,
         "localnet".into(),
         store,
-        Arc::new(NoApprover),
+        approver,
         Gbrain::disabled(),
     );
     (Arc::new(wallet), path)
@@ -136,7 +159,7 @@ async fn token_transfers_respect_token_limits() {
     );
     wallet.store.save_budget(&budget).await.unwrap();
 
-    let recipient = Pubkey::new_unique();
+    let recipient = Keypair::new().pubkey();
     let send = |amount: &str| Request::Send {
         to: recipient.to_string(),
         amount: amount.into(),
@@ -191,7 +214,7 @@ async fn concurrent_sends_cannot_jointly_exceed_the_daily_limit() {
         daily: 1_000_000_000,
     };
     let (wallet, db) = wallet_with(budget).await;
-    let recipient = Pubkey::new_unique();
+    let recipient = Keypair::new().pubkey();
 
     let mut tasks = Vec::new();
     for i in 0..5 {
@@ -219,5 +242,72 @@ async fn concurrent_sends_cannot_jointly_exceed_the_daily_limit() {
     assert_eq!(landed, 3, "0.3 × 3 fits in 1 SOL; a fourth must be refused");
     let received = rpc().get_balance(&recipient).await.unwrap();
     assert_eq!(received, 900_000_000);
+    let _ = std::fs::remove_file(db);
+}
+
+#[tokio::test]
+#[ignore]
+async fn waiting_for_approval_does_not_block_other_spending() {
+    let mut budget = Budget::default_for_cluster("localnet");
+    budget.send_sol = Limits {
+        per_op: 200_000_000,
+        daily: 1_000_000_000,
+    };
+    let (wallet, db) = wallet_with_approver(
+        budget,
+        Arc::new(SlowApprover(std::time::Duration::from_secs(8))),
+    )
+    .await;
+    let recipient = Keypair::new().pubkey();
+    let send = |amount: &str| Request::Send {
+        to: recipient.to_string(),
+        amount: amount.into(),
+        token: "SOL".into(),
+        memo: None,
+    };
+
+    let big_wallet = wallet.clone();
+    let big_request = send("0.5");
+    let big = tokio::spawn(async move {
+        big_wallet
+            .execute(big_request, Some("big-approval".into()), false)
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    // An in-budget payment goes through while the human is still deciding.
+    let started = std::time::Instant::now();
+    let small = wallet
+        .execute(send("0.1"), Some("small-auto".into()), false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(status(&small).as_str(), "confirmed" | "finalized"),
+        "{small}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(6));
+    assert!(
+        !big.is_finished(),
+        "the big payment should still be waiting"
+    );
+
+    // The pending 0.5 is reserved: 0.5 + 0.1 + 0.45 would pass the 1 SOL day.
+    let preview = wallet.execute(send("0.45"), None, true).await.unwrap();
+    assert_eq!(
+        preview["decision"]["decision"], "needs_approval",
+        "{preview}"
+    );
+    // Status stays responsive too.
+    wallet.status().await.unwrap();
+
+    let big = big.await.unwrap();
+    assert!(
+        matches!(status(&big).as_str(), "confirmed" | "finalized"),
+        "{big}"
+    );
+    assert_eq!(big["operation"]["approved_by"], "slow-test");
+    let received = rpc().get_balance(&recipient).await.unwrap();
+    assert_eq!(received, 600_000_000);
     let _ = std::fs::remove_file(db);
 }

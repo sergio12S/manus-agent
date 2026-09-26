@@ -111,6 +111,7 @@ pub struct AgentWallet {
     pub gbrain: Gbrain,
     pub jupiter: Jupiter,
     spend_lock: tokio::sync::Mutex<()>,
+    approval_lock: tokio::sync::Mutex<()>,
 }
 
 impl AgentWallet {
@@ -131,6 +132,7 @@ impl AgentWallet {
             gbrain,
             jupiter: Jupiter::from_env(),
             spend_lock: tokio::sync::Mutex::new(()),
+            approval_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -180,10 +182,22 @@ impl AgentWallet {
             }
         }
 
-        // One spending decision at a time, so concurrent calls cannot jointly exceed a limit.
-        let _guard = self.spend_lock.lock().await;
+        // Decisions are serialized so concurrent calls cannot jointly exceed a limit.
+        // The lock is held only while deciding and reserving, never while waiting for
+        // the human or for the network.
+        let guard = self.spend_lock.lock().await;
+        if let Some(id) = &request_id {
+            if let Some((stored_hash, record)) = self.store.find_by_request(id).await? {
+                if stored_hash != request_hash {
+                    return Err(anyhow::anyhow!(
+                        "request_id '{id}' was already used for a different operation"
+                    ));
+                }
+                return Ok(json!({ "idempotent_replay": true, "operation": view(&record) }));
+            }
+        }
         let budget = self.budget().await?;
-        let prepared = self.prepare(&request, &budget).await?;
+        let prepared = self.prepare_unique(&request, &budget).await?;
         let (effects, exposure) = self.evaluate(&prepared).await?;
         let spent = self.store.spent_last_day(None).await?;
         let decision = merge(decide(&budget, &spent, &exposure), &prepared.extra_reasons);
@@ -220,77 +234,137 @@ impl AgentWallet {
             )
             .await?;
 
-        let mut prepared = prepared;
-        if let Decision::NeedsApproval { reasons } = &decision {
-            let reason = approval_reason(&prepared.summary, reasons);
-            self.gbrain.emit(
-                "wallet.approval",
-                format!(
-                    "Manus asks for approval: {} ({})",
-                    prepared.summary,
-                    reasons.join("; ")
-                ),
-                5,
-            );
-            let approver = self.approver.clone();
-            let outcome = tokio::task::spawn_blocking(move || approver.request(&reason)).await?;
-            match outcome {
-                ApprovalOutcome::Approved { method } => {
-                    self.store.set_approval(&id, &method).await?;
-                }
-                ApprovalOutcome::Denied { reason } => {
-                    self.store
-                        .set_status(&id, "denied", None, None, Some(&reason))
-                        .await?;
-                    self.report(&id).await;
-                    return self.result(&id).await;
-                }
-            }
-            // The approved bytes may have outlived their blockhash while the human decided.
-            let still_valid = self
-                .rpc
-                .is_blockhash_valid(&prepared.blockhash, CommitmentConfig::processed())
-                .await
-                .unwrap_or(false);
-            if !still_valid {
-                let rebuilt = self.prepare(&request, &budget).await?;
-                let (_, rebuilt_exposure) = self.evaluate(&rebuilt).await?;
-                if !within_approved(&exposure, &rebuilt_exposure) {
-                    self.store
-                        .set_status(
-                            &id,
-                            "failed",
-                            None,
-                            None,
-                            Some("effects changed after approval; ask again"),
-                        )
-                        .await?;
-                    return self.result(&id).await;
-                }
-                prepared = rebuilt;
-            } else if let Err(error) = self.evaluate(&prepared).await {
+        let reasons = match &decision {
+            Decision::Deny { reason } => {
                 self.store
-                    .set_status(&id, "failed", None, None, Some(&error.to_string()))
+                    .set_status(&id, "denied", None, None, Some(reason))
                     .await?;
                 return self.result(&id).await;
             }
-        } else if let Decision::Deny { reason } = &decision {
-            self.store
-                .set_status(&id, "denied", None, None, Some(reason))
-                .await?;
-            return self.result(&id).await;
+            Decision::Auto => {
+                self.reserve(&id, &prepared).await?;
+                drop(guard);
+                self.broadcast(&id, &prepared).await?;
+                self.report(&id).await;
+                return self.result(&id).await;
+            }
+            Decision::NeedsApproval { reasons } => reasons.clone(),
+        };
+
+        // Reserve the amount while the human decides, then let other calls proceed.
+        let pending_signature = prepared.tx.signatures[0].to_string();
+        self.store
+            .set_status(
+                &id,
+                "awaiting_approval",
+                Some(&pending_signature),
+                None,
+                None,
+            )
+            .await?;
+        drop(guard);
+
+        let reason = approval_reason(&prepared.summary, &reasons);
+        self.gbrain.emit(
+            "wallet.approval",
+            format!(
+                "Manus asks for approval: {} ({})",
+                prepared.summary,
+                reasons.join("; ")
+            ),
+            5,
+        );
+        let outcome = {
+            // One system prompt at a time.
+            let _prompt = self.approval_lock.lock().await;
+            let approver = self.approver.clone();
+            tokio::task::spawn_blocking(move || approver.request(&reason)).await?
+        };
+        match outcome {
+            ApprovalOutcome::Approved { method } => {
+                self.store.set_approval(&id, &method).await?;
+            }
+            ApprovalOutcome::Denied { reason } => {
+                self.store
+                    .set_status(&id, "denied", None, None, Some(&reason))
+                    .await?;
+                self.report(&id).await;
+                return self.result(&id).await;
+            }
         }
 
-        self.submit(&id, &prepared).await?;
+        let guard = self.spend_lock.lock().await;
+        // The approved bytes may have outlived their blockhash while the human decided.
+        let still_valid = self
+            .rpc
+            .is_blockhash_valid(&prepared.blockhash, CommitmentConfig::processed())
+            .await
+            .unwrap_or(false);
+        let mut prepared = prepared;
+        let signature = prepared.tx.signatures[0].to_string();
+        let collides = self.store.signature_in_use(&signature, Some(&id)).await?;
+        if !still_valid || collides {
+            let rebuilt = match self.prepare_unique(&request, &budget).await {
+                Ok(rebuilt) => rebuilt,
+                Err(error) => return self.fail(&id, &error.to_string()).await,
+            };
+            match self.evaluate(&rebuilt).await {
+                Ok((_, rebuilt_exposure)) if within_approved(&exposure, &rebuilt_exposure) => {
+                    prepared = rebuilt;
+                }
+                Ok(_) => {
+                    return self
+                        .fail(&id, "effects changed after approval; ask again")
+                        .await
+                }
+                Err(error) => return self.fail(&id, &error.to_string()).await,
+            }
+        } else if let Err(error) = self.evaluate(&prepared).await {
+            return self.fail(&id, &error.to_string()).await;
+        }
+        self.reserve(&id, &prepared).await?;
+        drop(guard);
+        self.broadcast(&id, &prepared).await?;
         self.report(&id).await;
         self.result(&id).await
     }
 
-    async fn submit(&self, id: &str, prepared: &Prepared) -> anyhow::Result<()> {
+    /// Build the transaction, making sure its signature is not already owned by another
+    /// operation. Identical payments built within one blockhash would otherwise be the
+    /// same transaction, land once, and be counted twice. Call with `spend_lock` held.
+    async fn prepare_unique(&self, request: &Request, budget: &Budget) -> anyhow::Result<Prepared> {
+        for _ in 0..20 {
+            let prepared = self.prepare(request, budget).await?;
+            let signature = prepared.tx.signatures[0].to_string();
+            if !self.store.signature_in_use(&signature, None).await? {
+                return Ok(prepared);
+            }
+            // Wait for the next blockhash, which makes the bytes different.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        Err(anyhow::anyhow!(
+            "could not build a distinct transaction; an identical one is still in flight"
+        ))
+    }
+
+    async fn fail(&self, id: &str, error: &str) -> anyhow::Result<Value> {
+        self.store
+            .set_status(id, "failed", None, None, Some(error))
+            .await?;
+        self.report(id).await;
+        self.result(id).await
+    }
+
+    /// Record the signature and blockhash before broadcast; from here the amount counts as spent.
+    async fn reserve(&self, id: &str, prepared: &Prepared) -> anyhow::Result<()> {
         let signature = prepared.tx.signatures[0];
         self.store
             .set_submitting(id, &signature.to_string(), &prepared.blockhash.to_string())
-            .await?;
+            .await
+    }
+
+    /// Send the reserved transaction and follow it to confirmation.
+    async fn broadcast(&self, id: &str, prepared: &Prepared) -> anyhow::Result<()> {
         let config = RpcSendTransactionConfig {
             // The exact bytes were simulated a moment ago.
             skip_preflight: true,
@@ -341,7 +415,7 @@ impl AgentWallet {
         };
         if matches!(
             record.status.as_str(),
-            "finalized" | "failed" | "expired" | "denied"
+            "finalized" | "failed" | "expired" | "denied" | "awaiting_approval"
         ) {
             return Ok(record.status);
         }
@@ -642,7 +716,7 @@ impl AgentWallet {
         tx::inspect_structure(&prepared.tx, &wallet)?;
         let watched: Vec<&Asset> = prepared.watched.iter().collect();
         let effects = tx::simulate(&self.rpc, &prepared.tx, &wallet, &watched).await?;
-        let exposure = measure(&prepared.shape, &effects)?;
+        let exposure = measure(&prepared.shape, &effects, tx::max_network_fee(&prepared.tx))?;
         Ok((effects, exposure))
     }
 
@@ -706,7 +780,7 @@ impl AgentWallet {
             "address": self.address().to_string(),
             "cluster": self.cluster,
             "balances": balances,
-            "budget": budget_view(&budget, &self.cluster),
+            "budget": self.budget_view(&budget).await,
             "spent_last_24h": {
                 "send_sol": format_units(spent.send_sol, 9),
                 "convert_sol": format_units(spent.convert_sol, 9),
@@ -735,10 +809,9 @@ impl AgentWallet {
 
     /// Change the budget. Tightening applies at once; widening needs human approval.
     pub async fn change_budget(&self, proposed: Budget, why: &str) -> anyhow::Result<Value> {
-        let _guard = self.spend_lock.lock().await;
         let current = self.budget().await?;
         if current == proposed {
-            return Ok(json!({ "changed": false, "budget": budget_view(&current, &self.cluster) }));
+            return Ok(json!({ "changed": false, "budget": self.budget_view(&current).await }));
         }
         let mut approved_by = "not required (budget only tightened)".to_string();
         if !current.permits_without_approval(&proposed) {
@@ -751,27 +824,55 @@ impl AgentWallet {
                 format!("Manus asks to widen budget: {why}"),
                 5,
             );
-            let approver = self.approver.clone();
-            match tokio::task::spawn_blocking(move || approver.request(&reason)).await? {
+            let outcome = {
+                let _prompt = self.approval_lock.lock().await;
+                let approver = self.approver.clone();
+                tokio::task::spawn_blocking(move || approver.request(&reason)).await?
+            };
+            match outcome {
                 ApprovalOutcome::Approved { method } => approved_by = method,
                 ApprovalOutcome::Denied { reason } => {
                     return Ok(json!({ "changed": false, "denied": reason }));
                 }
             }
         }
-        self.store.save_budget(&proposed).await?;
+        {
+            let _guard = self.spend_lock.lock().await;
+            // The approval covered a change from `current`; refuse if that moved meanwhile.
+            if self.budget().await? != current {
+                return Err(anyhow::anyhow!(
+                    "the budget changed while waiting for approval; ask again"
+                ));
+            }
+            self.store.save_budget(&proposed).await?;
+        }
         self.gbrain
             .emit("wallet.budget", format!("Manus budget changed: {why}"), 2);
         Ok(json!({
             "changed": true,
             "approved_by": approved_by,
-            "budget": budget_view(&proposed, &self.cluster)
+            "budget": self.budget_view(&proposed).await
         }))
+    }
+
+    /// Human-unit view of a budget, using each token's on-chain decimals.
+    pub async fn budget_view(&self, budget: &Budget) -> Value {
+        let mut decimals = std::collections::BTreeMap::new();
+        for mint in budget.send_tokens.keys() {
+            if let Ok(asset) = tx::resolve_asset(&self.rpc, mint, &self.cluster).await {
+                decimals.insert(mint.clone(), asset.decimals);
+            }
+        }
+        budget_view(budget, &decimals)
     }
 }
 
 /// Derive what an operation really does from simulation, and check it matches the request.
-fn measure(shape: &Shape, effects: &SimulatedEffects) -> anyhow::Result<Exposure> {
+fn measure(
+    shape: &Shape,
+    effects: &SimulatedEffects,
+    network_fee_cap: u64,
+) -> anyhow::Result<Exposure> {
     match shape {
         Shape::SendSol { to, lamports } => {
             let total = effects.sol_out();
@@ -839,7 +940,11 @@ fn measure(shape: &Shape, effects: &SimulatedEffects) -> anyhow::Result<Exposure
                 }
             }
             let received = match output.mint {
-                None => effects.sol_after.saturating_sub(effects.sol_before) + SWAP_SOL_ALLOWANCE,
+                // The wallet pays the network fee out of the SOL it receives.
+                None => effects
+                    .sol_after
+                    .saturating_sub(effects.sol_before)
+                    .saturating_add(network_fee_cap),
                 Some(mint) => effects.token_delta(&mint.to_string()).1,
             };
             if received < quote.min_out_amount {
@@ -966,15 +1071,25 @@ fn effects_view(effects: &SimulatedEffects) -> Value {
     })
 }
 
-/// Human-unit view of a budget.
-pub fn budget_view(budget: &Budget, _cluster: &str) -> Value {
-    let limits = |l: &super::budget::Limits, decimals: u8| json!({ "per_op": format_units(l.per_op, decimals), "daily": format_units(l.daily, decimals) });
+/// Human-unit view of a budget. Token limits whose decimals are unknown are shown in base units.
+pub fn budget_view(
+    budget: &Budget,
+    token_decimals: &std::collections::BTreeMap<String, u8>,
+) -> Value {
+    let limits = |l: &crate::budget::Limits, decimals: u8| json!({ "per_op": format_units(l.per_op, decimals), "daily": format_units(l.daily, decimals) });
     json!({
         "send_sol": limits(&budget.send_sol, 9),
         "convert_sol": limits(&budget.convert_sol, 9),
         "send_tokens": budget.send_tokens.iter().map(|(mint, l)| {
-            let decimals = if tx::symbol_for_mint(mint) == Some("USDC") || tx::symbol_for_mint(mint) == Some("USDT") { 6 } else { 9 };
-            json!({ "mint": mint, "symbol": tx::symbol_for_mint(mint), "limits": limits(l, decimals) })
+            match token_decimals.get(mint) {
+                Some(decimals) => json!({
+                    "mint": mint, "symbol": tx::symbol_for_mint(mint), "limits": limits(l, *decimals)
+                }),
+                None => json!({
+                    "mint": mint, "symbol": tx::symbol_for_mint(mint),
+                    "limits_base_units": { "per_op": l.per_op, "daily": l.daily }
+                }),
+            }
         }).collect::<Vec<_>>(),
         "trusted_recipients": budget.trusted_recipients,
         "require_trusted_recipients": budget.require_trusted_recipients,
@@ -1005,12 +1120,12 @@ mod tests {
             to,
             lamports: 1_000,
         };
-        let exposure = measure(&shape, &effects(10_000, 3_995, vec![])).unwrap();
+        let exposure = measure(&shape, &effects(10_000, 3_995, vec![]), 5_000).unwrap();
         assert_eq!(exposure.sol_out, 1_000);
         assert_eq!(exposure.fees, 5_005);
         assert_eq!(exposure.recipient, Some(to.to_string()));
         // A transaction draining far more than requested is rejected outright.
-        assert!(measure(&shape, &effects(10_000_000, 0, vec![])).is_err());
+        assert!(measure(&shape, &effects(10_000_000, 0, vec![]), 5_000).is_err());
     }
 
     #[test]
@@ -1020,10 +1135,53 @@ mod tests {
             mint: "Mint".into(),
             amount: 50,
         };
-        let exposure = measure(&shape, &effects(10_000, 5_000, vec![("Mint", 100, 50)])).unwrap();
+        let exposure = measure(
+            &shape,
+            &effects(10_000, 5_000, vec![("Mint", 100, 50)]),
+            5_000,
+        )
+        .unwrap();
         assert_eq!(exposure.token_out, Some(("Mint".into(), 50)));
         assert_eq!((exposure.sol_out, exposure.fees), (0, 5_000));
-        assert!(measure(&shape, &effects(10_000, 5_000, vec![("Mint", 100, 0)])).is_err());
+        assert!(measure(
+            &shape,
+            &effects(10_000, 5_000, vec![("Mint", 100, 0)]),
+            5_000
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sol_output_must_reach_the_quoted_minimum_after_fees() {
+        let jito = Pubkey::new_unique();
+        let input = Asset {
+            symbol: "JitoSOL".into(),
+            mint: Some(jito),
+            decimals: 9,
+            token_program: Some(spl_token::id()),
+        };
+        let quote = Quote {
+            raw: json!({}),
+            in_amount: 1_000,
+            out_amount: 810_000,
+            min_out_amount: 800_000,
+            price_impact_pct: 0.0,
+            route: String::new(),
+            platform_fee: 0,
+            fee_bps: 0,
+        };
+        let shape = Shape::Convert {
+            input,
+            output: Asset::sol(),
+            quote: Box::new(quote),
+            input_value_lamports: 810_000,
+        };
+        let jito = jito.to_string();
+        let exact = effects(1_000_000, 1_795_000, vec![(jito.as_str(), 1_000, 0)]);
+        let exposure = measure(&shape, &exact, 5_000).unwrap();
+        assert_eq!(exposure.category, Category::Convert);
+        let short = effects(1_000_000, 1_794_999, vec![(jito.as_str(), 1_000, 0)]);
+        assert!(measure(&shape, &short, 5_000).is_err());
     }
 
     #[test]
