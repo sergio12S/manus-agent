@@ -1,4 +1,4 @@
-//! A small MCP server over stdio: the agent wallet's whole surface is nine tools.
+//! A small MCP server over stdio: the agent wallet's whole surface is twelve tools.
 
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -15,7 +15,10 @@ with Touch ID on their Mac; wait for the tool result, never try to approve yours
 Every operation is simulated first and judged by real balance changes. \
 Call wallet_status before spending, pass dry_run=true to preview, and always pass a stable request_id \
 for payments so a retry can never pay twice. Amounts are decimal strings in whole tokens (\"0.25\" SOL). \
-Transfers are free; swap, stake and unstake include a 0.1% Manus fee that dry_run shows in the summary.";
+Transfers are free; swap, stake and unstake include a 0.1% Manus fee that dry_run shows in the summary. \
+To bill another agent, create_invoice and give them the returned object. To pay a bill, pay_invoice. \
+The first payment to a new agent asks the human and then trusts that address inside the budget. \
+invoice_status reads the chain. Invoice payments are ordinary transfers and carry no Manus fee.";
 
 pub async fn run_stdio(wallet: Arc<AgentWallet>) -> anyhow::Result<()> {
     use tokio::io::{stdin, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -151,12 +154,37 @@ pub async fn call(wallet: &AgentWallet, name: &str, args: &Value) -> anyhow::Res
         }
         "history" => wallet.history(args["limit"].as_i64().unwrap_or(20)).await,
         "operation" => wallet.operation(&required("id")?).await,
+        "create_invoice" => {
+            wallet
+                .create_invoice(
+                    text("token").as_deref().unwrap_or("SOL"),
+                    &amount(args)?,
+                    &required("description")?,
+                    args["expires_in_hours"].as_u64().unwrap_or(168),
+                )
+                .await
+        }
+        "pay_invoice" => {
+            let document = invoice_document(args)?;
+            wallet.pay_invoice(&document, dry_run).await
+        }
+        "invoice_status" => wallet.invoice_status(&required("invoice_id")?).await,
         "change_budget" => {
             let proposed = apply_budget_changes(wallet, args).await?;
             let reason = text("reason").unwrap_or_else(|| "agent requested a budget change".into());
             wallet.change_budget(proposed, &reason).await
         }
         other => Err(anyhow::anyhow!("unknown tool '{other}'")),
+    }
+}
+
+/// `invoice` may be the object `create_invoice` returned, or that object as a JSON string.
+fn invoice_document(args: &Value) -> anyhow::Result<Value> {
+    match &args["invoice"] {
+        Value::Object(_) => Ok(args["invoice"].clone()),
+        Value::String(text) => serde_json::from_str(text)
+            .map_err(|error| anyhow::anyhow!("invoice must be the signed JSON object: {error}")),
+        _ => Err(anyhow::anyhow!("missing required argument 'invoice'")),
     }
 }
 
@@ -338,6 +366,45 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "create_invoice",
+            "description": "Sign a bill from this wallet. Give the returned object to the agent who should pay it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "amount": amount,
+                    "token": { "type": "string", "description": "SOL (default), USDC, USDT, JitoSOL, mSOL, or a mint address." },
+                    "description": { "type": "string", "description": "What this bill is for, one line, up to 160 characters." },
+                    "expires_in_hours": { "type": "integer", "description": "1-720. Default 168 (7 days)." }
+                },
+                "required": ["amount", "description"]
+            }
+        },
+        {
+            "name": "pay_invoice",
+            "description": "Pay a signed invoice with an ordinary transfer. The invoice id is the memo and the idempotency key, so this wallet cannot pay it twice. The first payment to a new agent asks the human; approving also trusts that address for later payments inside the budget.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "invoice": { "type": "object", "description": "The object returned by the payee's create_invoice." },
+                    "dry_run": dry_run
+                },
+                "required": ["invoice"]
+            },
+            "annotations": { "destructiveHint": true }
+        },
+        {
+            "name": "invoice_status",
+            "description": "See whether an invoice this wallet issued or accepted has been paid. Paid means a finalized transfer of the exact amount with the invoice id as the memo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "invoice_id": { "type": "string" }
+                },
+                "required": ["invoice_id"]
+            },
+            "annotations": { "readOnlyHint": true }
+        },
+        {
             "name": "change_budget",
             "description": "Change your budget. Tightening applies immediately; anything that widens it asks the human to approve with Touch ID. Explain why in 'reason'.",
             "inputSchema": {
@@ -377,7 +444,7 @@ mod tests {
     fn tool_surface_is_small_and_well_formed() {
         let tools = tools();
         let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 12);
         for tool in tools {
             assert!(tool["name"].is_string());
             assert!(tool["description"].as_str().unwrap().len() > 10);

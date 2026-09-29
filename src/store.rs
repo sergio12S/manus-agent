@@ -15,6 +15,19 @@ const COMMITTED_STATUSES: &str =
 /// spend the same allowance meanwhile. Reservations older than this were interrupted.
 const APPROVAL_RESERVATION_MINUTES: i64 = 10;
 
+#[derive(Debug, Clone)]
+pub struct InvoiceRecord {
+    pub invoice_id: String,
+    pub role: String,
+    pub document_json: String,
+    pub status: String,
+    pub payment_signature: Option<String>,
+    pub operation_id: Option<String>,
+    pub attempts: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: String,
@@ -89,6 +102,21 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS agent_budget (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 budget_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_invoices (
+                invoice_id TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                document_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payment_signature TEXT,
+                operation_id TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )",
         )
@@ -344,6 +372,85 @@ impl Store {
         }
         Ok(spent)
     }
+
+    pub async fn put_invoice(
+        &self,
+        invoice_id: &str,
+        role: &str,
+        document_json: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self.invoice(invoice_id).await? {
+            if existing.document_json != document_json {
+                return Err(anyhow::anyhow!(
+                    "invoice_id '{invoice_id}' already belongs to a different bill"
+                ));
+            }
+            return Ok(());
+        }
+        let now = now();
+        sqlx::query(
+            "INSERT INTO agent_invoices
+                (invoice_id, role, document_json, status, attempts, created_at, updated_at)
+             VALUES (?, ?, ?, 'open', 0, ?, ?)",
+        )
+        .bind(invoice_id)
+        .bind(role)
+        .bind(document_json)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn invoice(&self, invoice_id: &str) -> anyhow::Result<Option<InvoiceRecord>> {
+        let row = sqlx::query("SELECT * FROM agent_invoices WHERE invoice_id = ?")
+            .bind(invoice_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(invoice_from_row))
+    }
+
+    pub async fn update_invoice(
+        &self,
+        invoice_id: &str,
+        status: &str,
+        payment_signature: Option<&str>,
+        operation_id: Option<&str>,
+        attempts: Option<i64>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE agent_invoices SET status = ?,
+                payment_signature = COALESCE(?, payment_signature),
+                operation_id = COALESCE(?, operation_id),
+                attempts = COALESCE(?, attempts),
+                updated_at = ?
+             WHERE invoice_id = ?",
+        )
+        .bind(status)
+        .bind(payment_signature)
+        .bind(operation_id)
+        .bind(attempts)
+        .bind(now())
+        .bind(invoice_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+fn invoice_from_row(row: &sqlx::sqlite::SqliteRow) -> InvoiceRecord {
+    InvoiceRecord {
+        invoice_id: row.get("invoice_id"),
+        role: row.get("role"),
+        document_json: row.get("document_json"),
+        status: row.get("status"),
+        payment_signature: row.get("payment_signature"),
+        operation_id: row.get("operation_id"),
+        attempts: row.get("attempts"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
 }
 
 fn category_name(category: Category) -> &'static str {
@@ -470,6 +577,32 @@ mod tests {
         let budget = Budget::default_for_cluster("devnet");
         store.save_budget(&budget).await.unwrap();
         assert_eq!(store.budget().await.unwrap(), Some(budget));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn an_invoice_keeps_its_bill() {
+        let (store, path) = temp_store().await;
+        store
+            .put_invoice("inv_1", "issued", "{\"invoice\":1}")
+            .await
+            .unwrap();
+        store
+            .put_invoice("inv_1", "issued", "{\"invoice\":1}")
+            .await
+            .unwrap();
+        assert!(store
+            .put_invoice("inv_1", "issued", "{\"invoice\":2}")
+            .await
+            .is_err());
+        store
+            .update_invoice("inv_1", "paid", Some("sig"), Some("op_1"), Some(1))
+            .await
+            .unwrap();
+        let row = store.invoice("inv_1").await.unwrap().unwrap();
+        assert_eq!(row.status, "paid");
+        assert_eq!(row.payment_signature.as_deref(), Some("sig"));
+        assert_eq!(row.attempts, 1);
         let _ = std::fs::remove_file(path);
     }
 }

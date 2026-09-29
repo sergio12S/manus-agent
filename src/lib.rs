@@ -14,6 +14,7 @@ pub mod connect;
 pub mod crypto;
 pub mod engine;
 pub mod gbrain;
+pub mod invoice;
 pub mod keychain;
 pub mod mcp;
 pub mod mints;

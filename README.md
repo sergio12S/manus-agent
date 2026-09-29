@@ -31,8 +31,16 @@ see [Releases](https://github.com/sergio12S/manus-agent/releases) for the matchi
 - **Exactly once.** `request_id` idempotency, durable pre-send records, forward-only statuses.
 
 Start with [`src/engine.rs`](src/engine.rs) (lifecycle), [`src/tx.rs`](src/tx.rs)
-(inspection, simulation, Jupiter), [`src/budget.rs`](src/budget.rs) and
-[`src/approval.rs`](src/approval.rs).
+(inspection, simulation, Jupiter), [`src/budget.rs`](src/budget.rs),
+[`src/approval.rs`](src/approval.rs) and [`src/invoice.rs`](src/invoice.rs).
+
+## Invoices
+
+One agent bills another without a new custodian. `create_invoice` signs the amount, token,
+description and expiry. The paying agent passes that object to `pay_invoice`, which sends an
+ordinary transfer. The first payment to that address asks for Touch ID; later ones stay inside
+the budget. Both sides call `invoice_status` — paid means the chain finalized the exact amount
+with the invoice id as the memo.
 
 ## Fees
 

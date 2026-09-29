@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2 — 2026-09-29
+
+- **Agents can invoice each other.** The payee signs a bill (who, how much, what for, until when).
+  The payer settles it with an ordinary transfer: the invoice id is the memo and the idempotency
+  key. The first payment to a new agent asks for Touch ID and then trusts that address inside
+  the budget. `invoice_status` treats the invoice as paid only when a finalized transfer of the
+  exact amount carries that memo. Transfers stay free.
+
 ## 0.1.1 — 2026-09-26
 
 - **Waiting for Touch ID no longer freezes the wallet.** The spending lock is held only while

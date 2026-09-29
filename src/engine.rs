@@ -23,6 +23,7 @@ use std::time::Duration;
 use super::approval::{ApprovalOutcome, Approver};
 use super::budget::{decide, format_units, parse_units, Budget, Category, Decision, Exposure};
 use super::gbrain::Gbrain;
+use super::invoice::{self, SignedInvoice};
 use super::store::{OperationRecord, Store};
 use super::tx::{self, Asset, Jupiter, Quote, SimulatedEffects};
 use crate::mints::{JITO_SOL_MINT, SOL_MINT};
@@ -57,6 +58,16 @@ pub enum Request {
     Stake { amount: String },
     /// Instant unstake through the market: JitoSOL → SOL. `amount` may be "all".
     Unstake { amount: String },
+    /// Pay a signed invoice. The invoice id is the memo and the idempotency key.
+    PayInvoice {
+        invoice_id: String,
+        payee: String,
+        token: String,
+        amount: String,
+        description: String,
+        expires_at: String,
+        signature: String,
+    },
 }
 
 fn sol() -> String {
@@ -70,6 +81,7 @@ impl Request {
             Request::Swap { .. } => "swap",
             Request::Stake { .. } => "stake",
             Request::Unstake { .. } => "unstake",
+            Request::PayInvoice { .. } => "invoice",
         }
     }
 }
@@ -82,6 +94,8 @@ struct Prepared {
     watched: Vec<Asset>,
     shape: Shape,
     extra_reasons: Vec<String>,
+    /// Set when this invoice pays someone who is not trusted yet.
+    trust_after_approval: Option<String>,
 }
 
 enum Shape {
@@ -201,6 +215,7 @@ impl AgentWallet {
         let (effects, exposure) = self.evaluate(&prepared).await?;
         let spent = self.store.spent_last_day(None).await?;
         let decision = merge(decide(&budget, &spent, &exposure), &prepared.extra_reasons);
+        let trust_payee = prepared.trust_after_approval.clone();
 
         if dry_run {
             return Ok(json!({
@@ -210,6 +225,7 @@ impl AgentWallet {
                 "exposure": exposure_view(&exposure),
                 "simulation": effects_view(&effects),
                 "approval_method": self.approver.describe(),
+                "trusts_recipient_on_approval": trust_payee.is_some(),
             }));
         }
 
@@ -242,6 +258,9 @@ impl AgentWallet {
                 return self.result(&id).await;
             }
             Decision::Auto => {
+                if let Some(stopped) = self.block_closed_invoice(&id, &request).await? {
+                    return Ok(stopped);
+                }
                 self.reserve(&id, &prepared).await?;
                 drop(guard);
                 self.broadcast(&id, &prepared).await?;
@@ -264,7 +283,31 @@ impl AgentWallet {
             .await?;
         drop(guard);
 
-        let reason = approval_reason(&prepared.summary, &reasons);
+        let reason = if trust_payee.is_some() {
+            let mut text = "Manus: first payment to a new agent. Approving allows later payments to this address inside your budget.".to_string();
+            let extra: Vec<&str> = reasons
+                .iter()
+                .filter(|reason| reason.as_str() != invoice::FIRST_PAYMENT_REASON)
+                .map(String::as_str)
+                .collect();
+            if !extra.is_empty() {
+                text.push(' ');
+                text.push_str(&extra.join("; "));
+            }
+            text.push(' ');
+            text.push_str(&prepared.summary);
+            if text.len() > 240 {
+                let mut end = 237;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push('…');
+            }
+            text
+        } else {
+            approval_reason(&prepared.summary, &reasons)
+        };
         self.gbrain.emit(
             "wallet.approval",
             format!(
@@ -321,6 +364,12 @@ impl AgentWallet {
             }
         } else if let Err(error) = self.evaluate(&prepared).await {
             return self.fail(&id, &error.to_string()).await;
+        }
+        if let Some(stopped) = self.block_closed_invoice(&id, &request).await? {
+            return Ok(stopped);
+        }
+        if let Some(payee) = &trust_payee {
+            self.trust_recipient(payee).await?;
         }
         self.reserve(&id, &prepared).await?;
         drop(guard);
@@ -512,7 +561,6 @@ impl AgentWallet {
     // ------------------------------------------------------------ preparation
 
     async fn prepare(&self, request: &Request, budget: &Budget) -> anyhow::Result<Prepared> {
-        let wallet = self.address();
         match request {
             Request::Send {
                 to,
@@ -520,56 +568,26 @@ impl AgentWallet {
                 token,
                 memo,
             } => {
-                let to = Pubkey::from_str(to.trim())
-                    .map_err(|_| anyhow::anyhow!("'{to}' is not a Solana address"))?;
-                if to == wallet {
-                    return Err(anyhow::anyhow!("refusing to send to the wallet itself"));
-                }
-                if let Some(memo) = memo {
-                    if memo.len() > 200 {
-                        return Err(anyhow::anyhow!("memo is limited to 200 bytes"));
-                    }
-                }
-                let asset = tx::resolve_asset(&self.rpc, token, &self.cluster).await?;
-                let units = parse_units(amount, asset.decimals)?;
-                let summary = format!(
-                    "Send {} {} → {}",
-                    format_units(units, asset.decimals),
-                    asset.symbol,
-                    to
-                );
-                let (instructions, shape) = match asset.mint {
-                    None => (
-                        tx::sol_transfer_instructions(&wallet, &to, units, memo.as_deref()),
-                        Shape::SendSol {
-                            to,
-                            lamports: units,
-                        },
-                    ),
-                    Some(mint) => (
-                        tx::token_transfer_instructions(
-                            &wallet,
-                            &to,
-                            &asset,
-                            units,
-                            memo.as_deref(),
-                        )?,
-                        Shape::SendToken {
-                            to,
-                            mint: mint.to_string(),
-                            amount: units,
-                        },
-                    ),
-                };
-                let signed = tx::sign_instructions(&self.rpc, &self.signer, &instructions).await?;
-                Ok(Prepared {
-                    blockhash: *signed.message.recent_blockhash(),
-                    tx: signed,
-                    summary,
-                    watched: vec![asset],
-                    shape,
-                    extra_reasons: Vec::new(),
-                })
+                self.prepare_send(to, amount, token, memo.as_deref(), None, budget)
+                    .await
+            }
+            Request::PayInvoice {
+                invoice_id,
+                payee,
+                token,
+                amount,
+                description,
+                ..
+            } => {
+                self.prepare_send(
+                    payee,
+                    amount,
+                    token,
+                    Some(invoice_id),
+                    Some((invoice_id, description)),
+                    budget,
+                )
+                .await
             }
             Request::Swap {
                 from,
@@ -707,7 +725,413 @@ impl AgentWallet {
                 input_value_lamports,
             },
             extra_reasons,
+            trust_after_approval: None,
         })
+    }
+
+    async fn prepare_send(
+        &self,
+        to: &str,
+        amount: &str,
+        token: &str,
+        memo: Option<&str>,
+        invoice: Option<(&str, &str)>,
+        budget: &Budget,
+    ) -> anyhow::Result<Prepared> {
+        let wallet = self.address();
+        let to = Pubkey::from_str(to.trim())
+            .map_err(|_| anyhow::anyhow!("'{to}' is not a Solana address"))?;
+        if to == wallet {
+            return Err(anyhow::anyhow!("refusing to send to the wallet itself"));
+        }
+        if let Some(memo) = memo {
+            if memo.len() > 200 {
+                return Err(anyhow::anyhow!("memo is limited to 200 bytes"));
+            }
+        }
+        let asset = tx::resolve_asset(&self.rpc, token, &self.cluster).await?;
+        let units = parse_units(amount, asset.decimals)?;
+        let amount_text = format_units(units, asset.decimals);
+        let summary = if let Some((id, description)) = invoice {
+            let description: String = description.chars().take(80).collect();
+            format!(
+                "Pay invoice {id} ({description}): {amount_text} {} → {to}",
+                asset.symbol
+            )
+        } else {
+            format!("Send {amount_text} {} → {to}", asset.symbol)
+        };
+        let (instructions, shape) = match asset.mint {
+            None => (
+                tx::sol_transfer_instructions(&wallet, &to, units, memo),
+                Shape::SendSol {
+                    to,
+                    lamports: units,
+                },
+            ),
+            Some(mint) => (
+                tx::token_transfer_instructions(&wallet, &to, &asset, units, memo)?,
+                Shape::SendToken {
+                    to,
+                    mint: mint.to_string(),
+                    amount: units,
+                },
+            ),
+        };
+        let mut extra_reasons = Vec::new();
+        let mut trust_after_approval = None;
+        if invoice.is_some() && !invoice::recipient_is_trusted(&budget.trusted_recipients, &to) {
+            extra_reasons.push(invoice::FIRST_PAYMENT_REASON.to_string());
+            trust_after_approval = Some(to.to_string());
+        }
+        let signed = tx::sign_instructions(&self.rpc, &self.signer, &instructions).await?;
+        Ok(Prepared {
+            blockhash: *signed.message.recent_blockhash(),
+            tx: signed,
+            summary,
+            watched: vec![asset],
+            shape,
+            extra_reasons,
+            trust_after_approval,
+        })
+    }
+
+    /// Refuse to broadcast an invoice that expired or that someone already paid.
+    async fn block_closed_invoice(
+        &self,
+        id: &str,
+        request: &Request,
+    ) -> anyhow::Result<Option<Value>> {
+        let Request::PayInvoice {
+            invoice_id,
+            payee,
+            token,
+            amount,
+            expires_at,
+            ..
+        } = request
+        else {
+            return Ok(None);
+        };
+        if invoice::is_expired(expires_at) {
+            return Ok(Some(self.fail(id, "invoice expired").await?));
+        }
+        let payee = Pubkey::from_str(payee)?;
+        let asset = tx::resolve_asset(&self.rpc, token, &self.cluster).await?;
+        let units = parse_units(amount, asset.decimals)?;
+        if let Some(found) = invoice::find_payment(
+            &self.rpc,
+            &invoice::ExpectedPayment {
+                payee,
+                invoice_id,
+                units,
+                mint: asset.mint,
+                token_program: asset.token_program,
+            },
+            None,
+        )
+        .await?
+        {
+            let message = if found.finalized {
+                "invoice was already paid"
+            } else {
+                "invoice payment is already confirming"
+            };
+            return Ok(Some(self.fail(id, message).await?));
+        }
+        Ok(None)
+    }
+
+    /// Record a payee the human just approved. Call while holding `spend_lock`.
+    async fn trust_recipient(&self, payee: &str) -> anyhow::Result<()> {
+        let payee = Pubkey::from_str(payee)?;
+        let mut budget = self.budget().await?;
+        if invoice::recipient_is_trusted(&budget.trusted_recipients, &payee) {
+            return Ok(());
+        }
+        budget.trusted_recipients.push(payee.to_string());
+        self.store.save_budget(&budget).await
+    }
+
+    /// Sign a bill this wallet can be paid. Hand the result to the paying agent.
+    pub async fn create_invoice(
+        &self,
+        token: &str,
+        amount: &str,
+        description: &str,
+        hours: u64,
+    ) -> anyhow::Result<Value> {
+        let asset = tx::resolve_asset(&self.rpc, token, &self.cluster).await?;
+        let units = parse_units(amount, asset.decimals)?;
+        let token_name = match asset.mint {
+            None => "SOL".to_string(),
+            Some(mint) => {
+                let text = mint.to_string();
+                tx::symbol_for_mint(&text)
+                    .map(str::to_string)
+                    .unwrap_or(text)
+            }
+        };
+        let invoice = invoice::Invoice {
+            invoice_id: format!("inv_{}", uuid::Uuid::new_v4().simple()),
+            payee: self.address().to_string(),
+            token: token_name,
+            amount: format_units(units, asset.decimals),
+            description: description.trim().to_string(),
+            expires_at: invoice::expires_after(hours)?,
+            cluster: self.cluster.clone(),
+        };
+        let signed = invoice::sign(&invoice, &self.signer)?;
+        let document = serde_json::to_string(&signed)?;
+        self.store
+            .put_invoice(&invoice.invoice_id, "issued", &document)
+            .await?;
+        self.gbrain.emit(
+            "wallet.invoice",
+            format!(
+                "Manus invoice {} for {} {}",
+                invoice.invoice_id, invoice.amount, invoice.token
+            ),
+            1,
+        );
+        Ok(invoice_view(&signed, "open", Value::Null, false))
+    }
+
+    /// Pay a signed invoice. The first new payee asks the human, then is trusted.
+    pub async fn pay_invoice(&self, document: &Value, dry_run: bool) -> anyhow::Result<Value> {
+        let signed = invoice::parse_signed(document)?;
+        let invoice = &signed.invoice;
+        if invoice.cluster != self.cluster {
+            return Err(anyhow::anyhow!(
+                "invoice is for {}, this wallet is on {}",
+                invoice.cluster,
+                self.cluster
+            ));
+        }
+        if invoice::is_expired(&invoice.expires_at) {
+            return Err(anyhow::anyhow!("invoice expired"));
+        }
+        if invoice.payee == self.address().to_string() {
+            return Err(anyhow::anyhow!(
+                "this wallet issued the invoice; the other agent pays it"
+            ));
+        }
+        let document_json = serde_json::to_string(&signed)?;
+        if !dry_run {
+            self.store
+                .put_invoice(&invoice.invoice_id, "accepted", &document_json)
+                .await?;
+        }
+        if let Some(found) = self.locate_invoice(&signed, None).await? {
+            let status = if found.finalized {
+                "paid"
+            } else {
+                "confirming"
+            };
+            if !dry_run {
+                self.store
+                    .update_invoice(
+                        &invoice.invoice_id,
+                        status,
+                        Some(&found.signature),
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
+            return Ok(invoice_view(
+                &signed,
+                status,
+                json!({
+                    "signature": found.signature,
+                    "slot": found.slot,
+                    "finalized": found.finalized,
+                }),
+                self.payee_is_trusted(&invoice.payee).await?,
+            ));
+        }
+
+        let row = self.store.invoice(&invoice.invoice_id).await?;
+        if let Some(row) = row.as_ref().filter(|_| !dry_run) {
+            if let Some(operation_id) = &row.operation_id {
+                let status = self.refresh(operation_id).await?;
+                if !matches!(status.as_str(), "denied" | "failed" | "expired") {
+                    return Ok(invoice_view(
+                        &signed,
+                        &invoice_status_name(&status),
+                        self.result(operation_id).await?,
+                        self.payee_is_trusted(&invoice.payee).await?,
+                    ));
+                }
+                let record = self.store.get(operation_id).await?;
+                if record.as_ref().and_then(|record| record.error.as_deref())
+                    == Some("invoice was already paid")
+                {
+                    return self.invoice_status(&invoice.invoice_id).await;
+                }
+            }
+            if row.attempts >= 5 {
+                return Err(anyhow::anyhow!(
+                    "invoice payment was attempted too many times"
+                ));
+            }
+        }
+
+        let attempts = row.as_ref().map(|row| row.attempts).unwrap_or(0);
+        let request_id = if attempts == 0 {
+            invoice.invoice_id.clone()
+        } else {
+            format!("{}.{}", invoice.invoice_id, attempts + 1)
+        };
+        let next_attempts = if attempts == 0 { 1 } else { attempts + 1 };
+        let request = Request::PayInvoice {
+            invoice_id: invoice.invoice_id.clone(),
+            payee: invoice.payee.clone(),
+            token: invoice.token.clone(),
+            amount: invoice.amount.clone(),
+            description: invoice.description.clone(),
+            expires_at: invoice.expires_at.clone(),
+            signature: signed.signature.clone(),
+        };
+        let payment = self.execute(request, Some(request_id), dry_run).await?;
+        if dry_run {
+            return Ok(json!({
+                "invoice": signed.invoice,
+                "signature": signed.signature,
+                "payment": payment,
+            }));
+        }
+        let operation_id = payment["operation"]["id"].as_str().map(str::to_string);
+        let operation_status = payment["operation"]["status"].as_str().unwrap_or("open");
+        let payment_signature = payment["operation"]["signature"]
+            .as_str()
+            .map(str::to_string);
+        let status = invoice_status_name(operation_status);
+        self.store
+            .update_invoice(
+                &invoice.invoice_id,
+                &status,
+                payment_signature.as_deref(),
+                operation_id.as_deref(),
+                Some(next_attempts),
+            )
+            .await?;
+        Ok(invoice_view(
+            &signed,
+            &status,
+            payment,
+            self.payee_is_trusted(&invoice.payee).await?,
+        ))
+    }
+
+    /// Whether an invoice this wallet issued or accepted has been paid on-chain.
+    pub async fn invoice_status(&self, invoice_id: &str) -> anyhow::Result<Value> {
+        let row = self
+            .store
+            .invoice(invoice_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown invoice {invoice_id}"))?;
+        let signed = invoice::parse_signed(&serde_json::from_str(&row.document_json)?)?;
+        let hint = match &row.operation_id {
+            Some(operation_id) => self
+                .store
+                .get(operation_id)
+                .await?
+                .and_then(|record| record.signature)
+                .or(row.payment_signature.clone()),
+            None => row.payment_signature.clone(),
+        };
+        let trusted = self.payee_is_trusted(&signed.invoice.payee).await?;
+        match self.locate_invoice(&signed, hint.as_deref()).await {
+            Ok(Some(found)) => {
+                let status = if found.finalized {
+                    "paid"
+                } else {
+                    "confirming"
+                };
+                self.store
+                    .update_invoice(invoice_id, status, Some(&found.signature), None, None)
+                    .await?;
+                Ok(invoice_view(
+                    &signed,
+                    status,
+                    json!({
+                        "signature": found.signature,
+                        "slot": found.slot,
+                        "finalized": found.finalized,
+                    }),
+                    trusted,
+                ))
+            }
+            Ok(None) if invoice::is_expired(&signed.invoice.expires_at) && row.status != "paid" => {
+                self.store
+                    .update_invoice(invoice_id, "expired", None, None, None)
+                    .await?;
+                Ok(invoice_view(&signed, "expired", Value::Null, trusted))
+            }
+            Ok(None) => {
+                let payment = if let Some(operation_id) = &row.operation_id {
+                    self.refresh(operation_id).await?;
+                    self.result(operation_id).await?
+                } else {
+                    Value::Null
+                };
+                let status = payment["operation"]["status"]
+                    .as_str()
+                    .map(invoice_status_name)
+                    .unwrap_or_else(|| row.status.clone());
+                if status != row.status {
+                    self.store
+                        .update_invoice(invoice_id, &status, None, None, None)
+                        .await?;
+                }
+                Ok(invoice_view(&signed, &status, payment, trusted))
+            }
+            Err(error) => {
+                if let Some(operation_id) = &row.operation_id {
+                    if self.refresh(operation_id).await.ok().as_deref() == Some("finalized") {
+                        return Ok(invoice_view(
+                            &signed,
+                            "paid",
+                            self.result(operation_id).await?,
+                            trusted,
+                        ));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn locate_invoice(
+        &self,
+        signed: &SignedInvoice,
+        hint: Option<&str>,
+    ) -> anyhow::Result<Option<invoice::FoundPayment>> {
+        let asset = tx::resolve_asset(&self.rpc, &signed.invoice.token, &self.cluster).await?;
+        let units = parse_units(&signed.invoice.amount, asset.decimals)?;
+        invoice::find_payment(
+            &self.rpc,
+            &invoice::ExpectedPayment {
+                payee: Pubkey::from_str(&signed.invoice.payee)?,
+                invoice_id: &signed.invoice.invoice_id,
+                units,
+                mint: asset.mint,
+                token_program: asset.token_program,
+            },
+            hint,
+        )
+        .await
+    }
+
+    async fn payee_is_trusted(&self, payee: &str) -> anyhow::Result<bool> {
+        let Ok(payee) = Pubkey::from_str(payee) else {
+            return Ok(false);
+        };
+        Ok(invoice::recipient_is_trusted(
+            &self.budget().await?.trusted_recipients,
+            &payee,
+        ))
     }
 
     /// Inspect and simulate a prepared transaction, then measure its exposure.
@@ -794,7 +1218,8 @@ impl AgentWallet {
                 "Anything above it asks the human through the approval method; the agent cannot approve on its own.",
                 "Every operation is simulated first and judged by its real balance changes.",
                 "Use request_id to make retries safe; the same id never pays twice.",
-                "Transfers are free. Swaps, stake and unstake carry a 0.1% Manus fee, shown in the summary."
+                "Transfers are free. Swaps, stake and unstake carry a 0.1% Manus fee, shown in the summary.",
+                "create_invoice bills another agent. pay_invoice settles a signed bill. The first payment to a new agent asks you, then that address is trusted inside the budget."
             ]
         }))
     }
@@ -1027,6 +1452,28 @@ fn validate_request_id(id: &str) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn invoice_view(signed: &SignedInvoice, status: &str, payment: Value, trusted: bool) -> Value {
+    json!({
+        "invoice": signed.invoice,
+        "signature": signed.signature,
+        "status": status,
+        "payment": payment,
+        "counterparty_trusted": trusted,
+    })
+}
+
+fn invoice_status_name(operation_status: &str) -> String {
+    match operation_status {
+        "finalized" => "paid".into(),
+        "awaiting_approval" => "awaiting_approval".into(),
+        "denied" => "denied".into(),
+        "confirmed" | "processed" | "submitted" | "submitting" | "submission_unknown" => {
+            "confirming".into()
+        }
+        _ => "open".into(),
+    }
 }
 
 fn view(record: &OperationRecord) -> Value {

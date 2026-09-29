@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "manus-agent", version)]
 #[command(
-    about = "Your agent's own Solana wallet: budgeted, Touch ID above the budget, MCP for Claude/Codex/Gemini"
+    about = "Your agent's own Solana wallet: budgeted spending, invoices between agents, Touch ID above the budget"
 )]
 struct Args {
     /// Wallet name under ~/.manus

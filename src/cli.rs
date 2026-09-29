@@ -68,6 +68,34 @@ pub enum AgentAction {
     },
     /// Forget the Keychain password; agents cannot use the wallet until setup runs again
     Lock,
+    /// Bill another agent wallet, or pay a bill you were given
+    Invoice {
+        #[command(subcommand)]
+        action: InvoiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum InvoiceAction {
+    /// Sign a bill from this wallet
+    Create {
+        amount: String,
+        description: String,
+        /// SOL (default), USDC, USDT, JitoSOL, mSOL, or a mint address
+        #[arg(long, default_value = "SOL")]
+        token: String,
+        /// Hours until the bill expires (1-720, default 168)
+        #[arg(long, default_value_t = 168)]
+        hours: u64,
+    },
+    /// Pay a signed invoice. Pass the JSON, or @path to a file
+    Pay {
+        invoice: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// See whether an invoice has been paid
+    Status { invoice_id: String },
 }
 
 /// Run a `manus agent …` command for wallet `name`.
@@ -173,6 +201,34 @@ pub async fn run(name: &str, action: &AgentAction) -> anyhow::Result<()> {
             println!("🔒 Password removed from the Keychain. Agents can no longer use '{name}'.");
             Ok(())
         }
+        AgentAction::Invoice { action } => invoice_command(name, action).await,
+    }
+}
+
+async fn invoice_command(name: &str, action: &InvoiceAction) -> anyhow::Result<()> {
+    let wallet = agent_wallet::open(name).await?;
+    match action {
+        InvoiceAction::Create {
+            amount,
+            description,
+            token,
+            hours,
+        } => print(
+            wallet
+                .create_invoice(token, amount, description, *hours)
+                .await?,
+        ),
+        InvoiceAction::Pay { invoice, dry_run } => {
+            let text = if let Some(path) = invoice.strip_prefix('@') {
+                std::fs::read_to_string(path)
+                    .map_err(|error| anyhow::anyhow!("cannot read {path}: {error}"))?
+            } else {
+                invoice.clone()
+            };
+            let document = serde_json::from_str(&text)?;
+            print(wallet.pay_invoice(&document, *dry_run).await?)
+        }
+        InvoiceAction::Status { invoice_id } => print(wallet.invoice_status(invoice_id).await?),
     }
 }
 
