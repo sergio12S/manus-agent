@@ -5,10 +5,12 @@
 
 use manus_agent_wallet::{
     approval::{ApprovalOutcome, Approver, NoApprover},
-    budget::{Budget, Limits},
+    budget::{Budget, Category, Exposure, Limits},
     engine::{AgentWallet, Request},
     gbrain::Gbrain,
+    invoice, mcp,
     store::Store,
+    tx,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -243,6 +245,343 @@ async fn concurrent_sends_cannot_jointly_exceed_the_daily_limit() {
     let received = rpc().get_balance(&recipient).await.unwrap();
     assert_eq!(received, 900_000_000);
     let _ = std::fs::remove_file(db);
+}
+
+#[tokio::test]
+#[ignore]
+async fn independent_wallet_instances_share_the_daily_limit() {
+    let mut budget = Budget::default_for_cluster("localnet");
+    budget.send_sol = Limits {
+        per_op: 400_000_000,
+        daily: 1_000_000_000,
+    };
+    let (first, db) = wallet_with(budget).await;
+    let second = Arc::new(AgentWallet::new(
+        rpc(),
+        Keypair::try_from(first.signer.to_bytes().as_slice()).unwrap(),
+        "localnet".into(),
+        Store::open(&db).await.unwrap(),
+        Arc::new(NoApprover),
+        Gbrain::disabled(),
+    ));
+    let recipient = Keypair::new().pubkey();
+    let mut tasks = Vec::new();
+    for i in 0..5 {
+        let wallet = if i % 2 == 0 {
+            first.clone()
+        } else {
+            second.clone()
+        };
+        tasks.push(tokio::spawn(async move {
+            wallet
+                .execute(
+                    Request::Send {
+                        to: recipient.to_string(),
+                        amount: "0.3".into(),
+                        token: "SOL".into(),
+                        memo: None,
+                    },
+                    Some(format!("multi-{i}")),
+                    false,
+                )
+                .await
+                .unwrap()
+        }));
+    }
+    let mut landed = 0;
+    for task in tasks {
+        let result = task.await.unwrap();
+        if matches!(status(&result).as_str(), "confirmed" | "finalized") {
+            landed += 1;
+        }
+    }
+    assert_eq!(
+        landed, 3,
+        "two wallet instances must reserve the same allowance"
+    );
+    assert_eq!(rpc().get_balance(&recipient).await.unwrap(), 900_000_000);
+    let _ = std::fs::remove_file(db.with_extension("spend.lock"));
+    let _ = std::fs::remove_file(db);
+}
+
+#[tokio::test]
+#[ignore]
+async fn submitting_payment_is_recovered_after_reopening_the_wallet() {
+    let (first, db) = wallet_with(Budget::default_for_cluster("localnet")).await;
+    let recipient = Keypair::new().pubkey();
+    let transaction = tx::sign_instructions(
+        &first.rpc,
+        &first.signer,
+        &tx::sol_transfer_instructions(&first.address(), &recipient, 200_000_000, None),
+    )
+    .await
+    .unwrap();
+    let signature = transaction.signatures[0].to_string();
+    first
+        .store
+        .insert(
+            "recovered",
+            None,
+            "hash",
+            "send",
+            "0.2 SOL",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    first
+        .store
+        .set_evaluation(
+            "recovered",
+            "0.2 SOL",
+            &Exposure {
+                category: Category::Send,
+                sol_out: 200_000_000,
+                fees: 5_000,
+                token_out: None,
+                recipient: Some(recipient.to_string()),
+            },
+            &serde_json::json!({"decision": "auto"}),
+        )
+        .await
+        .unwrap();
+    first
+        .store
+        .set_submitting(
+            "recovered",
+            &signature,
+            &transaction.message.recent_blockhash().to_string(),
+        )
+        .await
+        .unwrap();
+    first.rpc.send_transaction(&transaction).await.unwrap();
+    let reopened = AgentWallet::new(
+        rpc(),
+        Keypair::try_from(first.signer.to_bytes().as_slice()).unwrap(),
+        "localnet".into(),
+        Store::open(&db).await.unwrap(),
+        Arc::new(NoApprover),
+        Gbrain::disabled(),
+    );
+    for _ in 0..30 {
+        reopened.status().await.unwrap();
+        let record = reopened.store.get("recovered").await.unwrap().unwrap();
+        if matches!(record.status.as_str(), "confirmed" | "finalized") {
+            assert_eq!(rpc().get_balance(&recipient).await.unwrap(), 200_000_000);
+            let _ = std::fs::remove_file(db.with_extension("spend.lock"));
+            let _ = std::fs::remove_file(db);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("submitting payment did not reconcile after reopening");
+}
+
+#[tokio::test]
+#[ignore]
+async fn missing_signature_after_blockhash_expiry_stays_unknown() {
+    let (wallet, db) = wallet_with(Budget::default_for_cluster("localnet")).await;
+    wallet
+        .store
+        .insert(
+            "unknown",
+            None,
+            "hash",
+            "send",
+            "unknown",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    wallet
+        .store
+        .set_evaluation(
+            "unknown",
+            "unknown",
+            &Exposure {
+                category: Category::Send,
+                sol_out: 200_000_000,
+                fees: 5_000,
+                token_out: None,
+                recipient: None,
+            },
+            &serde_json::json!({"decision": "auto"}),
+        )
+        .await
+        .unwrap();
+    let signature = Keypair::new().sign_message(b"never submitted").to_string();
+    wallet
+        .store
+        .set_submitting(
+            "unknown",
+            &signature,
+            &solana_sdk::hash::Hash::default().to_string(),
+        )
+        .await
+        .unwrap();
+    wallet.status().await.unwrap();
+    assert_eq!(
+        wallet.store.get("unknown").await.unwrap().unwrap().status,
+        "submission_unknown"
+    );
+    assert_eq!(
+        wallet.store.spent_last_day(None).await.unwrap().send_sol,
+        200_000_000
+    );
+    let invoice = invoice::Invoice {
+        invoice_id: "inv_unknown_after_expiry".into(),
+        payee: wallet.address().to_string(),
+        token: "SOL".into(),
+        amount: "0.2".into(),
+        description: "unknown settlement".into(),
+        expires_at: "2000-01-01T00:00:00Z".into(),
+        cluster: "localnet".into(),
+    };
+    let signed = invoice::sign(&invoice, &wallet.signer).unwrap();
+    wallet
+        .store
+        .put_invoice(
+            &invoice.invoice_id,
+            "issued",
+            &serde_json::to_string(&signed).unwrap(),
+        )
+        .await
+        .unwrap();
+    wallet
+        .store
+        .update_invoice(
+            &invoice.invoice_id,
+            "confirming",
+            Some(&signature),
+            Some("unknown"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        wallet.invoice_status(&invoice.invoice_id).await.unwrap()["status"],
+        "unknown"
+    );
+    let _ = std::fs::remove_file(db.with_extension("spend.lock"));
+    let _ = std::fs::remove_file(db);
+}
+
+#[tokio::test]
+#[ignore]
+async fn invoice_payment_is_found_beyond_the_first_history_page() {
+    let (payee, db) = wallet_with(Budget::default_for_cluster("localnet")).await;
+    let payer = Keypair::new();
+    fund(&rpc(), &payer.pubkey(), 2_000_000_000).await;
+    let created = payee
+        .create_invoice("SOL", "0.1", "pagination test", 168)
+        .await
+        .unwrap();
+    let invoice_id = created["invoice"]["invoice_id"].as_str().unwrap();
+    let payment = tx::sign_instructions(
+        &rpc(),
+        &payer,
+        &tx::sol_transfer_instructions(
+            &payer.pubkey(),
+            &payee.address(),
+            100_000_000,
+            Some(invoice_id),
+        ),
+    )
+    .await
+    .unwrap();
+    rpc().send_and_confirm_transaction(&payment).await.unwrap();
+
+    for index in 0..55 {
+        let memo = format!("unrelated-{index}");
+        let noise = tx::sign_instructions(
+            &rpc(),
+            &payer,
+            &tx::sol_transfer_instructions(&payer.pubkey(), &payee.address(), 1, Some(&memo)),
+        )
+        .await
+        .unwrap();
+        rpc().send_and_confirm_transaction(&noise).await.unwrap();
+    }
+
+    for _ in 0..30 {
+        let status = payee.invoice_status(invoice_id).await.unwrap();
+        if status["status"] == "paid" {
+            let _ = std::fs::remove_file(db.with_extension("spend.lock"));
+            let _ = std::fs::remove_file(db);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("payment beyond the first history page was not finalized and found");
+}
+
+#[tokio::test]
+#[ignore]
+async fn two_agents_complete_invoice_through_mcp_tools() {
+    let (payee, payee_db) = wallet_with(Budget::default_for_cluster("localnet")).await;
+    let (payer, payer_db) = wallet_with_approver(
+        Budget::default_for_cluster("localnet"),
+        Arc::new(SlowApprover(std::time::Duration::ZERO)),
+    )
+    .await;
+
+    let created = mcp::call(
+        &payee,
+        "create_invoice",
+        &serde_json::json!({
+            "amount": "0.1",
+            "token": "SOL",
+            "description": "localnet pilot",
+        }),
+    )
+    .await
+    .unwrap();
+    let invoice_id = created["invoice"]["invoice_id"].as_str().unwrap();
+    let paid = mcp::call(
+        &payer,
+        "pay_invoice",
+        &serde_json::json!({"invoice": created}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(paid["counterparty_trusted"], true, "{paid}");
+    let signature = paid["payment"]["operation"]["signature"]
+        .as_str()
+        .expect("payment receipt has a signature");
+
+    let replay = mcp::call(
+        &payer,
+        "pay_invoice",
+        &serde_json::json!({"invoice": created}),
+    )
+    .await
+    .unwrap();
+    let replay_signature = replay["payment"]["signature"]
+        .as_str()
+        .or_else(|| replay["payment"]["operation"]["signature"].as_str());
+    assert_eq!(replay_signature, Some(signature), "{replay}");
+
+    // A confirmed send can return before the validator accumulates the slots
+    // needed for finality. Allow up to 30 seconds for that separate condition.
+    for _ in 0..120 {
+        let state = mcp::call(
+            &payee,
+            "invoice_status",
+            &serde_json::json!({"invoice_id": invoice_id}),
+        )
+        .await
+        .unwrap();
+        if state["status"] == "paid" {
+            assert_eq!(state["payment"]["signature"], signature);
+            for db in [payee_db, payer_db] {
+                let _ = std::fs::remove_file(db.with_extension("spend.lock"));
+                let _ = std::fs::remove_file(db);
+            }
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("payee never observed a finalized invoice payment");
 }
 
 #[tokio::test]

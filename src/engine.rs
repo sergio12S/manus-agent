@@ -192,14 +192,22 @@ impl AgentWallet {
                         "request_id '{id}' was already used for a different operation"
                     ));
                 }
-                return Ok(json!({ "idempotent_replay": true, "operation": view(&record) }));
+                let _ = self.refresh(&record.id).await;
+                return Ok(json!({
+                    "idempotent_replay": true,
+                    "operation": view(&self.store.get(&record.id).await?.unwrap_or(record))
+                }));
             }
         }
 
-        // Decisions are serialized so concurrent calls cannot jointly exceed a limit.
-        // The lock is held only while deciding and reserving, never while waiting for
-        // the human or for the network.
+        if !dry_run {
+            self.reconcile_unsettled().await?;
+        }
+
+        // Serialize within this process and across every MCP process using the
+        // wallet database. Neither lock is held during approval or broadcast.
         let guard = self.spend_lock.lock().await;
+        let file_guard = self.store.lock_spending().await?;
         if let Some(id) = &request_id {
             if let Some((stored_hash, record)) = self.store.find_by_request(id).await? {
                 if stored_hash != request_hash {
@@ -262,6 +270,7 @@ impl AgentWallet {
                     return Ok(stopped);
                 }
                 self.reserve(&id, &prepared).await?;
+                drop(file_guard);
                 drop(guard);
                 self.broadcast(&id, &prepared).await?;
                 self.report(&id).await;
@@ -281,6 +290,7 @@ impl AgentWallet {
                 None,
             )
             .await?;
+        drop(file_guard);
         drop(guard);
 
         let reason = if trust_payee.is_some() {
@@ -337,6 +347,22 @@ impl AgentWallet {
         }
 
         let guard = self.spend_lock.lock().await;
+        let file_guard = self.store.lock_spending().await?;
+        if self
+            .store
+            .get(&id)
+            .await?
+            .is_none_or(|record| record.status != "awaiting_approval")
+        {
+            return self
+                .fail(&id, "approval reservation expired or changed; ask again")
+                .await;
+        }
+        if self.budget().await? != budget {
+            return self
+                .fail(&id, "budget changed after approval; ask again")
+                .await;
+        }
         // The approved bytes may have outlived their blockhash while the human decided.
         let still_valid = self
             .rpc
@@ -368,10 +394,13 @@ impl AgentWallet {
         if let Some(stopped) = self.block_closed_invoice(&id, &request).await? {
             return Ok(stopped);
         }
-        if let Some(payee) = &trust_payee {
-            self.trust_recipient(payee).await?;
-        }
         self.reserve(&id, &prepared).await?;
+        if let Some(payee) = &trust_payee {
+            if let Err(error) = self.trust_recipient(payee).await {
+                return self.fail(&id, &error.to_string()).await;
+            }
+        }
+        drop(file_guard);
         drop(guard);
         self.broadcast(&id, &prepared).await?;
         self.report(&id).await;
@@ -380,7 +409,7 @@ impl AgentWallet {
 
     /// Build the transaction, making sure its signature is not already owned by another
     /// operation. Identical payments built within one blockhash would otherwise be the
-    /// same transaction, land once, and be counted twice. Call with `spend_lock` held.
+    /// same transaction, land once, and be counted twice. Call with both spending locks held.
     async fn prepare_unique(&self, request: &Request, budget: &Budget) -> anyhow::Result<Prepared> {
         for _ in 0..20 {
             let prepared = self.prepare(request, budget).await?;
@@ -426,18 +455,12 @@ impl AgentWallet {
             .await
         {
             self.store
-                .set_status(
-                    id,
-                    "submission_unknown",
-                    None,
-                    None,
-                    Some(&error.to_string()),
-                )
+                .advance_chain_status(id, "submission_unknown", None, Some(&error.to_string()))
                 .await?;
             return Ok(());
         }
         self.store
-            .set_status(id, "submitted", None, None, None)
+            .advance_chain_status(id, "submitted", None, None)
             .await?;
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(750)).await;
@@ -500,21 +523,22 @@ impl AgentWallet {
                         .unwrap_or(true),
                     None => false,
                 };
-                if expired {
+                if expired && matches!(record.status.as_str(), "submitting" | "submitted") {
                     (
-                        "expired".to_string(),
+                        "submission_unknown".to_string(),
                         None,
-                        Some("blockhash expired before landing".to_string()),
+                        Some("signature not found after blockhash expiry; payment outcome is unknown".to_string()),
                     )
                 } else {
                     (record.status.clone(), None, record.error.clone())
                 }
             }
         };
-        if status != record.status || slot.is_some() {
-            self.store
-                .set_status(id, &status, None, slot, error.as_deref())
-                .await?;
+        if status != record.status {
+            return self
+                .store
+                .advance_chain_status(id, &status, slot, error.as_deref())
+                .await;
         }
         Ok(status)
     }
@@ -842,7 +866,7 @@ impl AgentWallet {
         Ok(None)
     }
 
-    /// Record a payee the human just approved. Call while holding `spend_lock`.
+    /// Record a payee the human just approved. Call while holding both spending locks.
     async fn trust_recipient(&self, payee: &str) -> anyhow::Result<()> {
         let payee = Pubkey::from_str(payee)?;
         let mut budget = self.budget().await?;
@@ -1063,23 +1087,35 @@ impl AgentWallet {
                     trusted,
                 ))
             }
-            Ok(None) if invoice::is_expired(&signed.invoice.expires_at) && row.status != "paid" => {
-                self.store
-                    .update_invoice(invoice_id, "expired", None, None, None)
-                    .await?;
-                Ok(invoice_view(&signed, "expired", Value::Null, trusted))
-            }
             Ok(None) => {
-                let payment = if let Some(operation_id) = &row.operation_id {
-                    self.refresh(operation_id).await?;
-                    self.result(operation_id).await?
+                let (operation_status, payment) = if let Some(operation_id) = &row.operation_id {
+                    let status = self.refresh(operation_id).await?;
+                    (Some(status), self.result(operation_id).await?)
                 } else {
-                    Value::Null
+                    (None, Value::Null)
                 };
-                let status = payment["operation"]["status"]
-                    .as_str()
-                    .map(invoice_status_name)
-                    .unwrap_or_else(|| row.status.clone());
+                let expired = invoice::is_expired(&signed.invoice.expires_at);
+                let can_expire = operation_status
+                    .as_deref()
+                    .is_none_or(|status| matches!(status, "denied" | "failed" | "expired"))
+                    && (row.payment_signature.is_none() || operation_status.is_some())
+                    && row.status != "paid";
+                let status = if row.status == "paid" {
+                    "paid".to_string()
+                } else if expired && can_expire {
+                    "expired".to_string()
+                } else if expired
+                    && row.status != "paid"
+                    && row.payment_signature.is_some()
+                    && operation_status.is_none()
+                {
+                    "unknown".to_string()
+                } else {
+                    operation_status
+                        .as_deref()
+                        .map(invoice_status_name)
+                        .unwrap_or_else(|| row.status.clone())
+                };
                 if status != row.status {
                     self.store
                         .update_invoice(invoice_id, &status, None, None, None)
@@ -1089,10 +1125,34 @@ impl AgentWallet {
             }
             Err(error) => {
                 if let Some(operation_id) = &row.operation_id {
-                    if self.refresh(operation_id).await.ok().as_deref() == Some("finalized") {
+                    let status = match self.refresh(operation_id).await {
+                        Ok(status) => status,
+                        Err(_) => self
+                            .store
+                            .get(operation_id)
+                            .await?
+                            .map(|record| record.status)
+                            .unwrap_or_default(),
+                    };
+                    if status == "finalized" {
                         return Ok(invoice_view(
                             &signed,
                             "paid",
+                            self.result(operation_id).await?,
+                            trusted,
+                        ));
+                    }
+                    if matches!(
+                        status.as_str(),
+                        "submitting"
+                            | "submitted"
+                            | "submission_unknown"
+                            | "processed"
+                            | "confirmed"
+                    ) {
+                        return Ok(invoice_view(
+                            &signed,
+                            &invoice_status_name(&status),
                             self.result(operation_id).await?,
                             trusted,
                         ));
@@ -1197,6 +1257,7 @@ impl AgentWallet {
     }
 
     pub async fn status(&self) -> anyhow::Result<Value> {
+        self.reconcile_unsettled().await?;
         let budget = self.budget().await?;
         let spent = self.store.spent_last_day(None).await?;
         let balances = self.balances().await?;
@@ -1225,11 +1286,18 @@ impl AgentWallet {
     }
 
     pub async fn history(&self, limit: i64) -> anyhow::Result<Value> {
-        for pending in self.store.unsettled().await? {
-            let _ = self.refresh(&pending.id).await;
-        }
+        self.reconcile_unsettled().await?;
         let records = self.store.recent(limit).await?;
         Ok(json!({ "operations": records.iter().map(view).collect::<Vec<_>>() }))
+    }
+
+    async fn reconcile_unsettled(&self) -> anyhow::Result<()> {
+        for pending in self.store.unsettled().await? {
+            // A failed RPC lookup must keep the durable reservation intact.
+            let _ = self.refresh(&pending.id).await;
+            self.store.mark_reconciled(&pending.id).await?;
+        }
+        Ok(())
     }
 
     /// Change the budget. Tightening applies at once; widening needs human approval.
@@ -1263,6 +1331,7 @@ impl AgentWallet {
         }
         {
             let _guard = self.spend_lock.lock().await;
+            let _file_guard = self.store.lock_spending().await?;
             // The approval covered a change from `current`; refuse if that moved meanwhile.
             if self.budget().await? != current {
                 return Err(anyhow::anyhow!(
@@ -1469,9 +1538,8 @@ fn invoice_status_name(operation_status: &str) -> String {
         "finalized" => "paid".into(),
         "awaiting_approval" => "awaiting_approval".into(),
         "denied" => "denied".into(),
-        "confirmed" | "processed" | "submitted" | "submitting" | "submission_unknown" => {
-            "confirming".into()
-        }
+        "submission_unknown" => "unknown".into(),
+        "confirmed" | "processed" | "submitted" | "submitting" => "confirming".into(),
         _ => "open".into(),
     }
 }

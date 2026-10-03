@@ -23,7 +23,9 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 const MEMO_PROGRAM: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
-const MAX_SIGNATURE_FETCHES: usize = 16;
+const SIGNATURE_PAGE_SIZE: usize = 50;
+const MAX_SIGNATURE_PAGES: usize = 20;
+const MAX_SIGNATURE_FETCHES: usize = 32;
 
 /// Shown to the human the first time an invoice pays someone new.
 pub const FIRST_PAYMENT_REASON: &str = "first payment to this agent; approving also allows later \
@@ -234,15 +236,19 @@ pub fn payment_matches(
 }
 
 /// Look for a payment of this invoice. A signature hint is checked first; otherwise
-/// the latest transactions on the payee (and their token account) are scanned.
+/// the payee's history is paged without assuming an invoice issue time. If the
+/// scan reaches a safety limit, return an error instead of claiming the bill is open.
 pub async fn find_payment(
     rpc: &RpcClient,
     expected: &ExpectedPayment<'_>,
     hint: Option<&str>,
 ) -> anyhow::Result<Option<FoundPayment>> {
+    let mut incomplete = false;
     if let Some(signature) = hint {
-        if let Some(found) = lookup_signature(rpc, signature, expected).await? {
-            return Ok(Some(found));
+        match lookup_signature(rpc, signature, expected).await {
+            Ok(Some(found)) => return Ok(Some(found)),
+            Ok(None) => {}
+            Err(_) => incomplete = true,
         }
     }
 
@@ -259,57 +265,79 @@ pub async fn find_payment(
     let mut fallback = Vec::new();
     let mut confirming = None;
     let mut fetches = 0usize;
+    // Signed invoices contain no issue time or maximum lifetime. An external
+    // issuer may have created one more than 30 days before its expiry, so a
+    // time cutoff could miss a real payment and permit a duplicate transfer.
     for address in addresses {
-        let signatures = rpc
-            .get_signatures_for_address_with_config(
-                &address,
-                GetConfirmedSignaturesForAddress2Config {
-                    before: None,
-                    until: None,
-                    limit: Some(50),
-                    commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
-                },
-            )
-            .await?;
-        for status in signatures {
-            if !seen.insert(status.signature.clone()) {
-                continue;
-            }
-            if status.err.is_some() {
-                continue;
-            }
-            match status.memo.as_deref() {
-                Some(memo) if memo.contains(expected.invoice_id) => {}
-                Some(_) => continue,
-                None => {
-                    if fallback.len() < 8 {
-                        fallback.push(status.signature);
-                    }
+        let mut before = None;
+        for page in 0..MAX_SIGNATURE_PAGES {
+            let signatures = rpc
+                .get_signatures_for_address_with_config(
+                    &address,
+                    GetConfirmedSignaturesForAddress2Config {
+                        before,
+                        until: None,
+                        limit: Some(SIGNATURE_PAGE_SIZE),
+                        commitment: Some(CommitmentConfig::confirmed()),
+                    },
+                )
+                .await?;
+            let page_len = signatures.len();
+            let next = signatures
+                .last()
+                .map(|status| Signature::from_str(&status.signature))
+                .transpose()?;
+            for status in signatures {
+                if !seen.insert(status.signature.clone()) || status.err.is_some() {
                     continue;
                 }
+                match status.memo.as_deref() {
+                    Some(memo) if memo.contains(expected.invoice_id) => {}
+                    Some(_) => continue,
+                    None => {
+                        if fallback.len() < MAX_SIGNATURE_FETCHES {
+                            fallback.push(status.signature);
+                        } else {
+                            incomplete = true;
+                        }
+                        continue;
+                    }
+                }
+                match consider(
+                    rpc,
+                    &status.signature,
+                    expected,
+                    &mut confirming,
+                    &mut fetches,
+                )
+                .await
+                {
+                    Ok(Some(found)) => return Ok(Some(found)),
+                    Ok(None) => {}
+                    Err(_) => incomplete = true,
+                }
             }
-            if let Some(found) = consider(
-                rpc,
-                &status.signature,
-                expected,
-                &mut confirming,
-                &mut fetches,
-            )
-            .await?
-            {
-                return Ok(Some(found));
+            if page_len < SIGNATURE_PAGE_SIZE {
+                break;
             }
+            if page + 1 == MAX_SIGNATURE_PAGES {
+                incomplete = true;
+                break;
+            }
+            before = next;
         }
     }
     for signature in fallback {
-        if fetches >= MAX_SIGNATURE_FETCHES {
-            break;
+        match consider(rpc, &signature, expected, &mut confirming, &mut fetches).await {
+            Ok(Some(found)) => return Ok(Some(found)),
+            Ok(None) => {}
+            Err(_) => incomplete = true,
         }
-        if let Some(found) =
-            consider(rpc, &signature, expected, &mut confirming, &mut fetches).await?
-        {
-            return Ok(Some(found));
-        }
+    }
+    if confirming.is_none() && incomplete {
+        return Err(anyhow::anyhow!(
+            "invoice payment search is incomplete; transaction history or RPC lookup could not be verified"
+        ));
     }
     Ok(confirming)
 }
@@ -322,7 +350,9 @@ async fn consider(
     fetches: &mut usize,
 ) -> anyhow::Result<Option<FoundPayment>> {
     if *fetches >= MAX_SIGNATURE_FETCHES {
-        return Ok(None);
+        return Err(anyhow::anyhow!(
+            "invoice payment search is incomplete; transaction fetch limit reached"
+        ));
     }
     *fetches += 1;
     match lookup_signature(rpc, signature, expected).await? {
@@ -345,7 +375,8 @@ async fn lookup_signature(
     let Ok(signature_key) = Signature::from_str(signature) else {
         return Ok(None);
     };
-    if let Some(found) = fetch_match(rpc, &signature_key, signature, expected, None).await? {
+    // A finalized lookup may fail while the transaction is only confirmed.
+    if let Ok(Some(found)) = fetch_match(rpc, &signature_key, signature, expected, None).await {
         return Ok(Some(found));
     }
     fetch_match(
@@ -366,39 +397,34 @@ async fn fetch_match(
     commitment: Option<CommitmentConfig>,
 ) -> anyhow::Result<Option<FoundPayment>> {
     let fetched = match commitment {
-        None => match rpc
-            .get_transaction(signature_key, UiTransactionEncoding::Base64)
-            .await
-        {
-            Ok(fetched) => fetched,
-            Err(_) => return Ok(None),
-        },
+        None => {
+            rpc.get_transaction(signature_key, UiTransactionEncoding::Base64)
+                .await?
+        }
         Some(commitment) => {
-            match rpc
-                .get_transaction_with_config(
-                    signature_key,
-                    RpcTransactionConfig {
-                        encoding: Some(UiTransactionEncoding::Base64),
-                        commitment: Some(commitment),
-                        max_supported_transaction_version: Some(0),
-                    },
-                )
-                .await
-            {
-                Ok(fetched) => fetched,
-                Err(_) => return Ok(None),
-            }
+            rpc.get_transaction_with_config(
+                signature_key,
+                RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    commitment: Some(commitment),
+                    max_supported_transaction_version: Some(0),
+                },
+            )
+            .await?
         }
     };
-    let Some(tx) = fetched.transaction.transaction.decode() else {
-        return Ok(None);
-    };
-    let meta = fetched.transaction.meta.as_ref();
-    let failed = meta.is_none_or(|meta| meta.err.is_some());
-    let (pre, post) = meta
-        .map(|meta| (meta.pre_balances.as_slice(), meta.post_balances.as_slice()))
-        .unwrap_or((&[], &[]));
-    let deltas = meta.map(token_deltas).unwrap_or_default();
+    let tx =
+        fetched.transaction.transaction.decode().ok_or_else(|| {
+            anyhow::anyhow!("cannot decode invoice payment candidate {signature}")
+        })?;
+    let meta = fetched
+        .transaction
+        .meta
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing invoice payment metadata for {signature}"))?;
+    let failed = meta.err.is_some();
+    let (pre, post) = (meta.pre_balances.as_slice(), meta.post_balances.as_slice());
+    let deltas = token_deltas(meta);
     if !payment_matches(&tx, failed, pre, post, &deltas, expected) {
         return Ok(None);
     }
@@ -543,6 +569,7 @@ fn token_paid(
 mod tests {
     use super::*;
     use crate::tx::{self, Asset};
+    use solana_client::rpc_request::RpcRequest;
     use solana_sdk::{
         hash::Hash,
         message::{Message, VersionedMessage},
@@ -558,6 +585,35 @@ mod tests {
             expires_at: "2099-01-01T00:00:00Z".into(),
             cluster: "devnet".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn old_payment_candidate_cannot_be_skipped_when_rpc_lookup_fails() {
+        let signature = Keypair::new().sign_message(b"old payment").to_string();
+        let expected = ExpectedPayment {
+            payee: Pubkey::new_unique(),
+            invoice_id: "inv_long_lived",
+            units: 1,
+            mint: None,
+            token_program: None,
+        };
+        let mocks = std::collections::HashMap::from([
+            (
+                RpcRequest::GetSignaturesForAddress,
+                serde_json::json!([{
+                    "signature": signature,
+                    "slot": 1,
+                    "err": null,
+                    "memo": expected.invoice_id,
+                    "blockTime": Utc::now().timestamp() - 90 * 24 * 3600,
+                    "confirmationStatus": "finalized"
+                }]),
+            ),
+            (RpcRequest::GetTransaction, Value::Null),
+        ]);
+        let rpc = RpcClient::new_mock_with_mocks("fails".into(), mocks);
+        let error = find_payment(&rpc, &expected, None).await.unwrap_err();
+        assert!(error.to_string().contains("incomplete"), "{error}");
     }
 
     #[test]

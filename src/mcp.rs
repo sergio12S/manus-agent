@@ -14,7 +14,8 @@ Inside the budget, send/swap/stake/unstake execute immediately. Above it, the hu
 with Touch ID on their Mac; wait for the tool result, never try to approve yourself. \
 Every operation is simulated first and judged by real balance changes. \
 Call wallet_status before spending, pass dry_run=true to preview, and always pass a stable request_id \
-for payments so a retry can never pay twice. Amounts are decimal strings in whole tokens (\"0.25\" SOL). \
+for payments so a retry uses the same receipt. If a receipt says submission_unknown, check its \
+signature before making a new payment with a different id. Amounts are decimal strings in whole tokens (\"0.25\" SOL). \
 Transfers are free; swap, stake and unstake include a 0.1% Manus fee that dry_run shows in the summary. \
 To bill another agent, create_invoice and give them the returned object. To pay a bill, pay_invoice. \
 The first payment to a new agent asks the human and then trusts that address inside the budget. \

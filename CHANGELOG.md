@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.3 — 2026-10-03
+
+- Spending decisions and reservations now share an OS lock across MCP processes using the same
+  wallet database. Budget changes use that lock too; approval prompts and network submission do
+  not hold it. An approval is rejected if its reservation or budget changed while the human waited.
+- On-chain operation statuses advance atomically, so a late RPC or submission response cannot
+  change a finalized payment back to an earlier status.
+- Interrupted `submitting` payments are reconciled before spending and on status/history reads.
+  If an expired blockhash has no signature in RPC history, the outcome remains unknown and its
+  request id cannot be retried as a fresh payment. Existing expired records with a transaction
+  signature are reclassified as unknown when the database opens.
+- Invoice lookup pages through payee history and reports an incomplete search instead of declaring
+  an unverified invoice open. An expired bill with an unresolved transfer remains unknown until
+  its payment outcome can be verified.
+- External invoices are searched without assuming a maximum lifetime, so older payments are
+  not skipped merely because they predate the local 30-day creation limit.
+- A separate-process regression verifies that the wallet spending lock crosses a process
+  boundary. The README and MCP instructions explain how to handle an uncertain submission.
+
 ## 0.1.2 — 2026-09-29
 
 - **Agents can invoice each other.** The payee signs a bill (who, how much, what for, until when).

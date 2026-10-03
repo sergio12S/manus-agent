@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use sqlx::Row;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use super::budget::{Budget, Category, Exposure, SpentToday};
@@ -49,6 +50,13 @@ pub struct OperationRecord {
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    spending_lock_path: PathBuf,
+}
+
+/// An OS lock shared by every process using this wallet database. Closing the
+/// file releases it, including when a process exits unexpectedly.
+pub struct SpendingLock {
+    _file: std::fs::File,
 }
 
 impl Store {
@@ -61,9 +69,38 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
-        let store = Self { pool };
+        let spending_lock_path = std::fs::canonicalize(path)?.with_extension("spend.lock");
+        let store = Self {
+            pool,
+            spending_lock_path,
+        };
         store.migrate().await?;
         Ok(store)
+    }
+
+    pub async fn lock_spending(&self) -> anyhow::Result<SpendingLock> {
+        let path = self.spending_lock_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options.open(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            #[cfg(not(unix))]
+            return Err(anyhow::anyhow!("spending lock requires Unix file locking"));
+            Ok::<_, anyhow::Error>(SpendingLock { _file: file })
+        })
+        .await?
     }
 
     async fn migrate(&self) -> anyhow::Result<()> {
@@ -120,6 +157,17 @@ impl Store {
                 updated_at TEXT NOT NULL
             )",
         )
+        .execute(&self.pool)
+        .await?;
+        // Older versions treated an expired blockhash plus an absent RPC status
+        // as proof of non-landing. That is ambiguous if transaction history was
+        // unavailable, so retain the signature and make retries conservative.
+        sqlx::query(
+            "UPDATE agent_operations SET status = 'submission_unknown',
+                error = 'legacy blockhash expiry did not prove non-landing', updated_at = ?
+             WHERE status = 'expired' AND signature IS NOT NULL",
+        )
+        .bind(now())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -245,6 +293,50 @@ impl Store {
         Ok(())
     }
 
+    /// Advance an on-chain status atomically. Concurrent RPC responses may arrive
+    /// out of order, including a late send response after a status refresh.
+    pub async fn advance_chain_status(
+        &self,
+        id: &str,
+        status: &str,
+        slot: Option<i64>,
+        error: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let rank = match status {
+            "submitted" => 1,
+            "submission_unknown" => 2,
+            "processed" => 3,
+            "confirmed" => 4,
+            "finalized" | "failed" | "expired" => 5,
+            _ => return Err(anyhow::anyhow!("invalid on-chain status '{status}'")),
+        };
+        sqlx::query(
+            "UPDATE agent_operations SET status = ?, slot = COALESCE(?, slot),
+                error = ?, updated_at = ?
+             WHERE id = ? AND status IN
+                ('submitting','submission_unknown','submitted','processed','confirmed')
+               AND CASE status
+                    WHEN 'submitting' THEN 0
+                    WHEN 'submitted' THEN 1
+                    WHEN 'submission_unknown' THEN 2
+                    WHEN 'processed' THEN 3
+                    WHEN 'confirmed' THEN 4
+                    ELSE 5 END < ?",
+        )
+        .bind(status)
+        .bind(slot)
+        .bind(error)
+        .bind(now())
+        .bind(id)
+        .bind(rank)
+        .execute(&self.pool)
+        .await?;
+        self.get(id)
+            .await?
+            .map(|record| record.status)
+            .ok_or_else(|| anyhow::anyhow!("unknown operation {id}"))
+    }
+
     /// Record the signature and blockhash durably before the bytes are broadcast.
     pub async fn set_submitting(
         &self,
@@ -252,10 +344,10 @@ impl Store {
         signature: &str,
         blockhash: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE agent_operations SET status = 'submitting', signature = ?, blockhash = ?,
                 error = NULL, updated_at = ?
-             WHERE id = ?",
+             WHERE id = ? AND status IN ('prepared', 'awaiting_approval')",
         )
         .bind(signature)
         .bind(blockhash)
@@ -263,6 +355,9 @@ impl Store {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow::anyhow!("operation {id} is no longer reservable"));
+        }
         Ok(())
     }
 
@@ -319,13 +414,26 @@ impl Store {
     pub async fn unsettled(&self) -> anyhow::Result<Vec<OperationRecord>> {
         let rows = sqlx::query(
             "SELECT * FROM agent_operations
-             WHERE status IN ('submitted','submission_unknown','processed','confirmed')
+             WHERE status IN ('submitting','submitted','submission_unknown','processed','confirmed')
                AND signature IS NOT NULL
-             ORDER BY created_at ASC LIMIT 50",
+             ORDER BY updated_at ASC LIMIT 50",
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(record_from_row).collect())
+    }
+
+    /// Rotate the bounded reconciliation batch even when an RPC lookup fails.
+    pub async fn mark_reconciled(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE agent_operations SET updated_at = ? WHERE id = ?
+             AND status IN ('submitting','submitted','submission_unknown','processed','confirmed')",
+        )
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Close reservations whose approval wait was interrupted (crash, restart).
@@ -494,6 +602,173 @@ fn now() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn spending_lock_child_process() {
+        let Ok(path) = std::env::var("MANUS_AGENT_LOCK_TEST_DB") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = Store::open(&path).await.unwrap();
+            std::fs::write(path.with_extension("ready"), b"ready").unwrap();
+            let _guard = store.lock_spending().await.unwrap();
+            std::fs::write(path.with_extension("acquired"), b"acquired").unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn spending_lock_blocks_another_process() {
+        let (store, path) = temp_store().await;
+        let guard = store.lock_spending().await.unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::tests::spending_lock_child_process"])
+            .env("MANUS_AGENT_LOCK_TEST_DB", &path)
+            .spawn()
+            .unwrap();
+        let ready = path.with_extension("ready");
+        let acquired = path.with_extension("acquired");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "child exited before ready"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child did not open the shared wallet database");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !acquired.exists(),
+            "child acquired a lock held by this process"
+        );
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while child.try_wait().unwrap().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child did not finish after lock release");
+        assert!(child.wait().unwrap().success());
+        assert!(acquired.exists(), "child never acquired the released lock");
+        for file in [ready, acquired, path.with_extension("spend.lock"), path] {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+
+    #[tokio::test]
+    async fn spending_lock_serializes_independent_store_instances() {
+        let (first, path) = temp_store().await;
+        let second = Store::open(&path).await.unwrap();
+        let guard = first.lock_spending().await.unwrap();
+        let blocked = tokio::spawn(async move { second.lock_spending().await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !blocked.is_finished(),
+            "a second store acquired the spending lock"
+        );
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), blocked)
+            .await
+            .expect("the lock was not released")
+            .unwrap();
+        let _ = std::fs::remove_file(path.with_extension("spend.lock"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn chain_status_never_moves_backward() {
+        let (store, path) = temp_store().await;
+        store
+            .insert("op", None, "hash", "send", "send", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .set_submitting("op", "signature", "blockhash")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .advance_chain_status("op", "submission_unknown", None, None)
+                .await
+                .unwrap(),
+            "submission_unknown"
+        );
+        assert_eq!(
+            store
+                .advance_chain_status("op", "submitted", None, None)
+                .await
+                .unwrap(),
+            "submission_unknown"
+        );
+        assert_eq!(
+            store
+                .advance_chain_status("op", "processed", Some(10), None)
+                .await
+                .unwrap(),
+            "processed"
+        );
+        assert_eq!(
+            store
+                .advance_chain_status("op", "submitted", None, None)
+                .await
+                .unwrap(),
+            "processed"
+        );
+        assert_eq!(
+            store
+                .advance_chain_status("op", "finalized", Some(12), None)
+                .await
+                .unwrap(),
+            "finalized"
+        );
+        assert_eq!(
+            store
+                .advance_chain_status("op", "confirmed", Some(11), None)
+                .await
+                .unwrap(),
+            "finalized"
+        );
+        assert_eq!(
+            store
+                .advance_chain_status("op", "failed", None, Some("late error"))
+                .await
+                .unwrap(),
+            "finalized"
+        );
+        let record = store.get("op").await.unwrap().unwrap();
+        assert_eq!(record.slot, Some(12));
+        assert_eq!(record.error, None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn legacy_expired_submission_is_unknown_after_reopen() {
+        let (store, path) = temp_store().await;
+        store
+            .insert("old", None, "hash", "send", "send", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .set_submitting("old", "signature", "blockhash")
+            .await
+            .unwrap();
+        store
+            .set_status("old", "expired", None, None, None)
+            .await
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&path).await.unwrap();
+        assert_eq!(
+            reopened.get("old").await.unwrap().unwrap().status,
+            "submission_unknown"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     async fn temp_store() -> (Store, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("manus-agent-{}.db", uuid::Uuid::new_v4()));
         (Store::open(&path).await.unwrap(), path)
@@ -567,6 +842,10 @@ mod tests {
             .unwrap();
         assert_eq!(store.spent_last_day(None).await.unwrap().send_sol, 0);
         assert_eq!(store.get("wait").await.unwrap().unwrap().status, "denied");
+        assert!(store
+            .set_submitting("wait", "signature", "blockhash")
+            .await
+            .is_err());
         let _ = std::fs::remove_file(path);
     }
 

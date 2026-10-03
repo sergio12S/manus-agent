@@ -30,7 +30,9 @@ see [Releases](https://github.com/sergio12S/manus-agent/releases) for the matchi
   simulated byte-for-byte, and measured by the wallet's real balance changes.
 - **A gate the agent cannot press.** Above the budget, macOS LocalAuthentication asks for
   Touch ID or the login password. Widening the budget and moving to mainnet use the same gate.
-- **Exactly once.** `request_id` idempotency, durable pre-send records, forward-only statuses.
+- **Safe retries.** A `request_id` identifies one operation. The wallet records its signature
+  before broadcast, reuses the existing receipt on retry, and never starts a second payment for
+  that id. An interrupted submission may need reconciliation before its outcome is known.
 
 Start with [`src/engine.rs`](src/engine.rs) (lifecycle), [`src/tx.rs`](src/tx.rs)
 (inspection, simulation, Jupiter), [`src/budget.rs`](src/budget.rs),
@@ -43,6 +45,16 @@ description and expiry. The paying agent passes that object to `pay_invoice`, wh
 ordinary transfer. The first payment to that address asks for Touch ID; later ones stay inside
 the budget. Both sides call `invoice_status` — paid means the chain finalized the exact amount
 with the invoice id as the memo.
+
+## If a payment outcome is unknown
+
+If a send was interrupted and RPC cannot establish whether its signature landed, the receipt
+shows `submission_unknown` (or `unknown` for an invoice). The amount remains counted against
+the rolling budget, and retrying the same `request_id` returns the original receipt rather than
+sending again. Check the recorded signature in a reliable transaction-history RPC or explorer
+before deciding whether to create a new payment. A missing RPC result alone does not prove the
+payment failed. Invoice lookup also reports an incomplete search when it cannot verify the
+relevant recipient history.
 
 ## Fees
 
