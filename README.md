@@ -1,6 +1,6 @@
 # Manus agent wallet
 
-[![M8ven Score](https://m8ven.ai/badge/mcp/sergio12s-manus-agent-11my2k?v=ec359c5b990ed2b834ea7897df635df9)](https://m8ven.ai/mcp/sergio12s-manus-agent-11my2k?s=readme)
+[![M8ven Score](https://m8ven.ai/badge/mcp/sergio12s-manus-agent-11my2k)](https://m8ven.ai/mcp/sergio12s-manus-agent-11my2k?s=readme)
 
 A Solana wallet your AI agent operates on its own, inside a budget you set. Anything above
 the budget waits for your Touch ID. Every operation is simulated first and leaves a receipt.
