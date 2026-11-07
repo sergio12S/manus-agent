@@ -49,6 +49,19 @@ pub struct Budget {
     pub require_trusted_recipients: bool,
     /// Largest slippage an agent may request for conversions.
     pub max_slippage_bps: u16,
+    /// Tokens (mint addresses or canonical symbols) allowed for swaps without approval when `require_allowed_tokens` is true.
+    #[serde(default)]
+    pub allowed_tokens: Vec<String>,
+    /// When true, swapping into any token outside `allowed_tokens` requires approval.
+    #[serde(default)]
+    pub require_allowed_tokens: bool,
+    /// Minimum seconds between committed conversions before the next swap executes without approval.
+    #[serde(default)]
+    pub swap_cooldown_secs: u64,
+    /// Daily realized-loss circuit breaker in lamports (0 = disabled). When trailing-24h realized loss
+    /// exceeds this threshold, new non-exit conversions require human approval.
+    #[serde(default)]
+    pub max_daily_loss_sol: u64,
 }
 
 impl Budget {
@@ -80,16 +93,28 @@ impl Budget {
             trusted_recipients: Vec::new(),
             require_trusted_recipients: false,
             max_slippage_bps: 100,
+            allowed_tokens: Vec::new(),
+            require_allowed_tokens: false,
+            swap_cooldown_secs: 0,
+            max_daily_loss_sol: 0,
         }
     }
 
     /// True when `proposed` grants no permission this budget does not already grant.
     /// Only a non-widening change may be applied without human approval.
     pub fn permits_without_approval(&self, proposed: &Budget) -> bool {
+        let loss_limit_widened = match (self.max_daily_loss_sol, proposed.max_daily_loss_sol) {
+            (0, _) => false,
+            (_, 0) => true,
+            (cur, prop) => prop > cur,
+        };
         if !self.send_sol.covers(&proposed.send_sol)
             || !self.convert_sol.covers(&proposed.convert_sol)
             || proposed.max_slippage_bps > self.max_slippage_bps
             || (self.require_trusted_recipients && !proposed.require_trusted_recipients)
+            || (self.require_allowed_tokens && !proposed.require_allowed_tokens)
+            || proposed.swap_cooldown_secs < self.swap_cooldown_secs
+            || loss_limit_widened
         {
             return false;
         }
@@ -103,6 +128,10 @@ impl Budget {
             .trusted_recipients
             .iter()
             .all(|recipient| self.trusted_recipients.contains(recipient))
+            && proposed
+                .allowed_tokens
+                .iter()
+                .all(|token| self.allowed_tokens.contains(token))
     }
 }
 
@@ -364,6 +393,16 @@ mod tests {
             },
         );
         assert!(!current.permits_without_approval(&new_token));
+
+        let mut with_cooldown = current.clone();
+        with_cooldown.swap_cooldown_secs = 300;
+        with_cooldown.require_allowed_tokens = true;
+        assert!(current.permits_without_approval(&with_cooldown));
+        assert!(!with_cooldown.permits_without_approval(&current));
+
+        let mut with_allowed_mint = with_cooldown.clone();
+        with_allowed_mint.allowed_tokens.push("SOL".into());
+        assert!(!with_cooldown.permits_without_approval(&with_allowed_mint));
     }
 
     #[test]

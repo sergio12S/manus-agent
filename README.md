@@ -36,15 +36,36 @@ see [Releases](https://github.com/sergio12S/manus-agent/releases) for the matchi
 
 Start with [`src/engine.rs`](src/engine.rs) (lifecycle), [`src/tx.rs`](src/tx.rs)
 (inspection, simulation, Jupiter), [`src/budget.rs`](src/budget.rs),
-[`src/approval.rs`](src/approval.rs) and [`src/invoice.rs`](src/invoice.rs).
+[`src/approval.rs`](src/approval.rs), [`src/invoice.rs`](src/invoice.rs),
+[`src/x402.rs`](src/x402.rs), [`src/verify.rs`](src/verify.rs) and
+[`src/trading.rs`](src/trading.rs).
 
-## Invoices
+## Crypto trading execution, bracket triggers & portfolio PnL
+
+Agents can pair external market-intelligence MCP servers (such as [AIPricePatterns](https://aipricepatterns.com)) with Manus as their dedicated **execution, risk-firewall, and portfolio layer** on Solana mainnet:
+
+- **`quote` (`manus agent quote <from> <to> <amount> [--kelly-fraction <0..1>]`)**: fetches a live Jupiter quote, effective rate, price impact, inspects the on-chain SPL Token / Token-2022 mint for `freeze_authority`, `mint_authority`, `PermanentDelegate`, `TransferHook`, `NonTransferable`, and transfer fees (`risk_level`: `safe`, `caution`, `high_risk`), and sizes positions via `kelly_fraction` (or `amount="kelly"`) against your live SOL balance and remaining daily `convert_sol` budget.
+- **One-call bracket `swap` (`take_profit_pct`, `stop_loss_pct`, `trailing_stop_bps`, `tag`)**: executes a Jupiter swap and atomically attaches an active exit trigger on the exact received token balance (`to -> from`), tagging the position (e.g. `"BULL_TREND_15m"`) for PnL attribution.
+- **Autonomous Take-Profit / Stop-Loss / OCO / Trailing-Stop triggers (`create_trigger`, `list_triggers`, `cancel_trigger` & `manus agent trigger`)**: the background watcher inside `manus agent mcp` (or `manus agent trigger watch`) polls live Jupiter quotes every 15s, updates `peak_rate` for trailing stops, and executes the exit swap automatically inside your budget.
+- **Automatic trading guards & daily loss circuit breaker**: swapping into an unknown token with an active `freeze_authority`, Token-2022 permanent delegate, or transfer fee automatically requires Touch ID approval even inside the budget. Operators can also set `allowed_tokens`, `require_allowed_tokens`, `swap_cooldown_secs`, and `max_daily_loss_sol` (blocks new non-exit entries when 24h realized loss reaches the threshold, while still permitting defensive exits into `SOL`, `USDC`, or `USDT`).
+- **`portfolio` (`manus agent portfolio`)**: tracks on-chain balances, weighted-average entry price in SOL, cost basis, realized/unrealized PnL, active triggers, and closed-trade **Win Rate / Profit Factor** broken down by strategy `tag`.
+
+## Invoices, x402 APIs and receipt verification
 
 One agent bills another without a new custodian. `create_invoice` signs the amount, token,
 description and expiry. The paying agent passes that object to `pay_invoice`, which sends an
 ordinary transfer. The first payment to that address asks for Touch ID; later ones stay inside
 the budget. Both sides call `invoice_status` — paid means the chain finalized the exact amount
 with the invoice id as the memo.
+
+When an HTTP service responds with `402 Payment Required` (x402 v2), the agent passes the
+challenge or `PAYMENT-REQUIRED` header to `pay_x402` (or `manus agent x402 pay`). Manus verifies
+the network, asset and atomic amount against the wallet's budget, settles the transfer with an
+on-chain memo, and returns both a portable `manus.receipt.v1` and a base64 `payment_header`
+proof to retry the HTTP request.
+
+Any signed invoice, `manus.receipt.v1` document or operation receipt can be verified offline or
+against Solana RPC using the `verify` MCP tool or `manus agent verify <target>`.
 
 ## If a payment outcome is unknown
 

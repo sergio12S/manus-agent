@@ -30,6 +30,46 @@ pub struct InvoiceRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeRecord {
+    pub operation_id: String,
+    pub kind: String,
+    pub input_mint: String,
+    pub input_symbol: String,
+    pub input_amount: u64,
+    pub input_decimals: u8,
+    pub output_mint: String,
+    pub output_symbol: String,
+    pub output_amount: u64,
+    pub output_decimals: u8,
+    pub sol_value_lamports: u64,
+    #[serde(default)]
+    pub tag: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerRecord {
+    pub id: String,
+    pub from_token: String,
+    pub to_token: String,
+    pub amount: String,
+    pub slippage_bps: u16,
+    pub take_profit_rate: Option<f64>,
+    pub stop_loss_rate: Option<f64>,
+    #[serde(default)]
+    pub trailing_stop_bps: Option<u16>,
+    #[serde(default)]
+    pub peak_rate: Option<f64>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    pub status: String,
+    pub triggered_reason: Option<String>,
+    pub operation_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: String,
     pub request_id: Option<String>,
@@ -159,6 +199,58 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_trades (
+                operation_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                input_mint TEXT NOT NULL,
+                input_symbol TEXT NOT NULL,
+                input_amount INTEGER NOT NULL,
+                input_decimals INTEGER NOT NULL,
+                output_mint TEXT NOT NULL,
+                output_symbol TEXT NOT NULL,
+                output_amount INTEGER NOT NULL,
+                output_decimals INTEGER NOT NULL,
+                sol_value_lamports INTEGER NOT NULL,
+                tag TEXT,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        let _ = sqlx::query("ALTER TABLE agent_trades ADD COLUMN tag TEXT")
+            .execute(&self.pool)
+            .await;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_triggers (
+                id TEXT PRIMARY KEY,
+                from_token TEXT NOT NULL,
+                to_token TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                slippage_bps INTEGER NOT NULL,
+                take_profit_rate REAL,
+                stop_loss_rate REAL,
+                trailing_stop_bps INTEGER,
+                peak_rate REAL,
+                tag TEXT,
+                status TEXT NOT NULL,
+                triggered_reason TEXT,
+                operation_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        let _ = sqlx::query("ALTER TABLE agent_triggers ADD COLUMN trailing_stop_bps INTEGER")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE agent_triggers ADD COLUMN peak_rate REAL")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE agent_triggers ADD COLUMN tag TEXT")
+            .execute(&self.pool)
+            .await;
         // Older versions treated an expired blockhash plus an absent RPC status
         // as proof of non-landing. That is ambiguous if transaction history was
         // unavailable, so retain the signature and make retries conservative.
@@ -481,6 +573,193 @@ impl Store {
         Ok(spent)
     }
 
+    /// Seconds elapsed since the most recent committed or pending conversion operation.
+    pub async fn last_conversion_age_secs(
+        &self,
+        except_id: Option<&str>,
+    ) -> anyhow::Result<Option<u64>> {
+        self.expire_stale_approvals().await?;
+        let row = sqlx::query(&format!(
+            "SELECT created_at FROM agent_operations
+             WHERE category = 'convert' AND id != ?
+               AND (status IN ({COMMITTED_STATUSES}) OR status = 'awaiting_approval')
+             ORDER BY created_at DESC LIMIT 1"
+        ))
+        .bind(except_id.unwrap_or(""))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let created_at: String = row.get("created_at");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&created_at)
+            .map(|dt| dt.with_timezone(&chrono::Utc))?;
+        let elapsed = (chrono::Utc::now() - parsed).num_seconds().max(0) as u64;
+        Ok(Some(elapsed))
+    }
+
+    pub async fn record_trade(&self, trade: &TradeRecord) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_trades
+                (operation_id, kind, input_mint, input_symbol, input_amount, input_decimals,
+                 output_mint, output_symbol, output_amount, output_decimals, sol_value_lamports, tag, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(operation_id) DO UPDATE SET
+                input_amount = excluded.input_amount,
+                output_amount = excluded.output_amount,
+                sol_value_lamports = excluded.sol_value_lamports,
+                tag = COALESCE(excluded.tag, agent_trades.tag)",
+        )
+        .bind(&trade.operation_id)
+        .bind(&trade.kind)
+        .bind(&trade.input_mint)
+        .bind(&trade.input_symbol)
+        .bind(trade.input_amount as i64)
+        .bind(trade.input_decimals as i64)
+        .bind(&trade.output_mint)
+        .bind(&trade.output_symbol)
+        .bind(trade.output_amount as i64)
+        .bind(trade.output_decimals as i64)
+        .bind(trade.sol_value_lamports as i64)
+        .bind(&trade.tag)
+        .bind(&trade.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Chronological list of committed conversions for portfolio cost-basis and PnL tracking.
+    pub async fn committed_trades(&self) -> anyhow::Result<Vec<TradeRecord>> {
+        let rows = sqlx::query(&format!(
+            "SELECT t.* FROM agent_trades t
+             INNER JOIN agent_operations o ON o.id = t.operation_id
+             WHERE o.status IN ({COMMITTED_STATUSES})
+             ORDER BY t.created_at ASC"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TradeRecord {
+                operation_id: row.get("operation_id"),
+                kind: row.get("kind"),
+                input_mint: row.get("input_mint"),
+                input_symbol: row.get("input_symbol"),
+                input_amount: row.get::<i64, _>("input_amount").max(0) as u64,
+                input_decimals: row.get::<i64, _>("input_decimals").clamp(0, 18) as u8,
+                output_mint: row.get("output_mint"),
+                output_symbol: row.get("output_symbol"),
+                output_amount: row.get::<i64, _>("output_amount").max(0) as u64,
+                output_decimals: row.get::<i64, _>("output_decimals").clamp(0, 18) as u8,
+                sol_value_lamports: row.get::<i64, _>("sol_value_lamports").max(0) as u64,
+                tag: row.try_get("tag").ok().flatten(),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    pub async fn put_trigger(&self, trigger: &TriggerRecord) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_triggers
+                (id, from_token, to_token, amount, slippage_bps, take_profit_rate, stop_loss_rate,
+                 trailing_stop_bps, peak_rate, tag, status, triggered_reason, operation_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&trigger.id)
+        .bind(&trigger.from_token)
+        .bind(&trigger.to_token)
+        .bind(&trigger.amount)
+        .bind(trigger.slippage_bps as i64)
+        .bind(trigger.take_profit_rate)
+        .bind(trigger.stop_loss_rate)
+        .bind(trigger.trailing_stop_bps.map(|v| v as i64))
+        .bind(trigger.peak_rate)
+        .bind(&trigger.tag)
+        .bind(&trigger.status)
+        .bind(&trigger.triggered_reason)
+        .bind(&trigger.operation_id)
+        .bind(&trigger.created_at)
+        .bind(&trigger.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_trigger_peak(&self, id: &str, peak_rate: f64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE agent_triggers SET peak_rate = ?, updated_at = ?
+             WHERE id = ? AND status = 'active'",
+        )
+        .bind(peak_rate)
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_triggers(&self, active_only: bool) -> anyhow::Result<Vec<TriggerRecord>> {
+        let query = if active_only {
+            "SELECT * FROM agent_triggers WHERE status = 'active' ORDER BY created_at ASC"
+        } else {
+            "SELECT * FROM agent_triggers ORDER BY created_at DESC LIMIT 100"
+        };
+        let rows = sqlx::query(query).fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(trigger_from_row).collect())
+    }
+
+    pub async fn cancel_trigger(&self, id: &str) -> anyhow::Result<Option<TriggerRecord>> {
+        sqlx::query(
+            "UPDATE agent_triggers SET status = 'cancelled', updated_at = ?
+             WHERE id = ? AND status = 'active'",
+        )
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let row = sqlx::query("SELECT * FROM agent_triggers WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(trigger_from_row))
+    }
+
+    /// Atomically claim an active trigger so two background watchers never fire the same OCO bracket twice.
+    pub async fn claim_trigger(&self, id: &str, reason: &str) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "UPDATE agent_triggers SET status = 'executing', triggered_reason = ?, updated_at = ?
+             WHERE id = ? AND status = 'active'",
+        )
+        .bind(reason)
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    pub async fn finish_trigger(
+        &self,
+        id: &str,
+        status: &str,
+        operation_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE agent_triggers SET status = ?, operation_id = COALESCE(?, operation_id),
+                triggered_reason = COALESCE(?, triggered_reason), updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(operation_id)
+        .bind(reason)
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn put_invoice(
         &self,
         invoice_id: &str,
@@ -556,6 +835,30 @@ fn invoice_from_row(row: &sqlx::sqlite::SqliteRow) -> InvoiceRecord {
         payment_signature: row.get("payment_signature"),
         operation_id: row.get("operation_id"),
         attempts: row.get("attempts"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn trigger_from_row(row: &sqlx::sqlite::SqliteRow) -> TriggerRecord {
+    TriggerRecord {
+        id: row.get("id"),
+        from_token: row.get("from_token"),
+        to_token: row.get("to_token"),
+        amount: row.get("amount"),
+        slippage_bps: row.get::<i64, _>("slippage_bps").clamp(1, 10_000) as u16,
+        take_profit_rate: row.get("take_profit_rate"),
+        stop_loss_rate: row.get("stop_loss_rate"),
+        trailing_stop_bps: row
+            .try_get::<Option<i64>, _>("trailing_stop_bps")
+            .ok()
+            .flatten()
+            .map(|v| v.clamp(1, 9_999) as u16),
+        peak_rate: row.try_get("peak_rate").ok().flatten(),
+        tag: row.try_get("tag").ok().flatten(),
+        status: row.get("status"),
+        triggered_reason: row.get("triggered_reason"),
+        operation_id: row.get("operation_id"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }

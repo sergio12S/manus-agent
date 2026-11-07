@@ -53,6 +53,8 @@ pub enum Request {
         amount: String,
         #[serde(default)]
         slippage_bps: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
     },
     /// Liquid staking: SOL → JitoSOL.
     Stake { amount: String },
@@ -68,6 +70,17 @@ pub enum Request {
         expires_at: String,
         signature: String,
     },
+    /// Pay an HTTP 402 (x402 v2) challenge.
+    PayX402 {
+        resource_url: String,
+        domain: String,
+        payee: String,
+        token: String,
+        amount: String,
+        memo: String,
+        #[serde(default)]
+        description: Option<String>,
+    },
 }
 
 fn sol() -> String {
@@ -82,6 +95,7 @@ impl Request {
             Request::Stake { .. } => "stake",
             Request::Unstake { .. } => "unstake",
             Request::PayInvoice { .. } => "invoice",
+            Request::PayX402 { .. } => "x402",
         }
     }
 }
@@ -96,6 +110,8 @@ struct Prepared {
     extra_reasons: Vec<String>,
     /// Set when this invoice pays someone who is not trusted yet.
     trust_after_approval: Option<String>,
+    /// Strategy or signal tag attached to a conversion trade.
+    tag: Option<String>,
 }
 
 enum Shape {
@@ -222,7 +238,39 @@ impl AgentWallet {
         let prepared = self.prepare_unique(&request, &budget).await?;
         let (effects, exposure) = self.evaluate(&prepared).await?;
         let spent = self.store.spent_last_day(None).await?;
-        let decision = merge(decide(&budget, &spent, &exposure), &prepared.extra_reasons);
+        let mut extra_reasons = prepared.extra_reasons.clone();
+        if exposure.category == Category::Convert && budget.swap_cooldown_secs > 0 {
+            if let Some(elapsed) = self.store.last_conversion_age_secs(None).await? {
+                if elapsed < budget.swap_cooldown_secs {
+                    extra_reasons.push(format!(
+                        "swap cooldown active ({elapsed}s elapsed, minimum {}s)",
+                        budget.swap_cooldown_secs
+                    ));
+                }
+            }
+        }
+        if exposure.category == Category::Convert && budget.max_daily_loss_sol > 0 {
+            let is_defensive_exit = match &prepared.shape {
+                Shape::Convert { output, .. } => {
+                    matches!(output.symbol.as_str(), "SOL" | "USDC" | "USDT")
+                }
+                _ => false,
+            };
+            if !is_defensive_exit {
+                let trades = self.store.committed_trades().await?;
+                let realized_24h = crate::trading::realized_pnl_last_24h_lamports(&trades);
+                if realized_24h < 0
+                    && (realized_24h.unsigned_abs() as u64) >= budget.max_daily_loss_sol
+                {
+                    extra_reasons.push(format!(
+                        "daily loss circuit breaker active (realized 24h PnL -{} SOL exceeds max_daily_loss_sol {} SOL)",
+                        format_units(realized_24h.unsigned_abs() as u64, 9),
+                        format_units(budget.max_daily_loss_sol, 9)
+                    ));
+                }
+            }
+        }
+        let decision = merge(decide(&budget, &spent, &exposure), &extra_reasons);
         let trust_payee = prepared.trust_after_approval.clone();
 
         if dry_run {
@@ -438,7 +486,34 @@ impl AgentWallet {
         let signature = prepared.tx.signatures[0];
         self.store
             .set_submitting(id, &signature.to_string(), &prepared.blockhash.to_string())
-            .await
+            .await?;
+        if let Shape::Convert {
+            input,
+            output,
+            quote,
+            input_value_lamports,
+        } = &prepared.shape
+        {
+            let _ = self
+                .store
+                .record_trade(&crate::store::TradeRecord {
+                    operation_id: id.to_string(),
+                    kind: "convert".to_string(),
+                    input_mint: input.mint_or_wsol(),
+                    input_symbol: input.symbol.clone(),
+                    input_amount: quote.in_amount,
+                    input_decimals: input.decimals,
+                    output_mint: output.mint_or_wsol(),
+                    output_symbol: output.symbol.clone(),
+                    output_amount: quote.out_amount,
+                    output_decimals: output.decimals,
+                    sol_value_lamports: *input_value_lamports,
+                    tag: prepared.tag.clone(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                })
+                .await;
+        }
+        Ok(())
     }
 
     /// Send the reserved transaction and follow it to confirmation.
@@ -613,14 +688,38 @@ impl AgentWallet {
                 )
                 .await
             }
+            Request::PayX402 {
+                domain,
+                payee,
+                token,
+                amount,
+                memo,
+                description,
+                ..
+            } => {
+                let label = description.as_deref().unwrap_or(domain.as_str());
+                self.prepare_send(
+                    payee,
+                    amount,
+                    token,
+                    Some(memo),
+                    Some((domain, label)),
+                    budget,
+                )
+                .await
+            }
             Request::Swap {
                 from,
                 to,
                 amount,
                 slippage_bps,
+                tag,
             } => {
-                self.prepare_conversion(from, to, amount, *slippage_bps, budget, "Swap")
-                    .await
+                let mut prep = self
+                    .prepare_conversion(from, to, amount, *slippage_bps, budget, "Swap")
+                    .await?;
+                prep.tag = tag.clone();
+                Ok(prep)
             }
             Request::Stake { amount } => {
                 self.prepare_conversion("SOL", JITO_SOL_MINT, amount, None, budget, "Stake")
@@ -672,6 +771,18 @@ impl AgentWallet {
                 "slippage {slippage} bps exceeds the agent limit of {} bps",
                 budget.max_slippage_bps
             ));
+        }
+        if budget.require_allowed_tokens
+            && !crate::trading::token_is_allowed(&budget.allowed_tokens, &output, &self.cluster)
+        {
+            extra_reasons.push(format!(
+                "output token {} ({}) is not in allowed_tokens",
+                output.symbol,
+                output.mint_or_wsol()
+            ));
+        }
+        if let Ok(output_safety) = crate::trading::inspect_asset_safety(&self.rpc, &output).await {
+            extra_reasons.extend(output_safety.approval_reasons);
         }
         // The Manus fee is only charged when the fee wallet can receive the output token;
         // the agent's wallet never pays to create that account.
@@ -750,6 +861,7 @@ impl AgentWallet {
             },
             extra_reasons,
             trust_after_approval: None,
+            tag: None,
         })
     }
 
@@ -778,10 +890,17 @@ impl AgentWallet {
         let amount_text = format_units(units, asset.decimals);
         let summary = if let Some((id, description)) = invoice {
             let description: String = description.chars().take(80).collect();
-            format!(
-                "Pay invoice {id} ({description}): {amount_text} {} → {to}",
-                asset.symbol
-            )
+            if memo.is_some_and(|m| m.starts_with("x402:")) {
+                format!(
+                    "Pay x402 {id} ({description}): {amount_text} {} → {to}",
+                    asset.symbol
+                )
+            } else {
+                format!(
+                    "Pay invoice {id} ({description}): {amount_text} {} → {to}",
+                    asset.symbol
+                )
+            }
         } else {
             format!("Send {amount_text} {} → {to}", asset.symbol)
         };
@@ -817,6 +936,7 @@ impl AgentWallet {
             shape,
             extra_reasons,
             trust_after_approval,
+            tag: None,
         })
     }
 
@@ -1194,6 +1314,765 @@ impl AgentWallet {
         ))
     }
 
+    /// Pay an HTTP 402 (x402 v2) challenge inside the wallet's budget and return a
+    /// portable `manus.receipt.v1` plus a base64 `payment_header` proof. When `http`
+    /// (`url`) is provided, Manus fetches the resource, handles the 402 challenge,
+    /// and automatically retries the request with the signed payment header.
+    pub async fn pay_x402(
+        &self,
+        challenge: Option<&Value>,
+        payment_required_header: Option<&str>,
+        http: Option<crate::x402::HttpCall>,
+        request_id: Option<String>,
+        dry_run: bool,
+    ) -> anyhow::Result<Value> {
+        let parsed = match (challenge, payment_required_header, http.as_ref()) {
+            (None, None, Some(call)) => match crate::x402::probe_url(call).await? {
+                crate::x402::ProbeOutcome::NoPaymentNeeded(response) => {
+                    return Ok(json!({
+                        "paid": false,
+                        "http_response": response,
+                    }));
+                }
+                crate::x402::ProbeOutcome::PaymentRequired(parsed) => parsed,
+            },
+            _ => crate::x402::decode_challenge(challenge, payment_required_header)?,
+        };
+        let resolved = crate::x402::resolve_challenge(&parsed, &self.cluster)?;
+        if let Some(call) = http.as_ref() {
+            let requested_host = crate::x402::parse_http_host(&call.url)?;
+            if requested_host != resolved.domain {
+                return Err(anyhow::anyhow!(
+                    "x402 challenge resource host '{}' does not match requested URL host '{requested_host}'",
+                    resolved.domain
+                ));
+            }
+        }
+        if resolved.payee == self.address() {
+            return Err(anyhow::anyhow!(
+                "refusing to pay x402 challenge to the wallet itself"
+            ));
+        }
+        let asset = tx::resolve_asset(&self.rpc, &resolved.asset, &self.cluster).await?;
+        let amount = format_units(resolved.amount_atomic, asset.decimals);
+        let req_id = request_id.unwrap_or_else(|| crate::x402::default_request_id(&resolved));
+        let memo = crate::x402::memo_for(&resolved.domain, &req_id);
+        let request = Request::PayX402 {
+            resource_url: resolved.resource_url.clone(),
+            domain: resolved.domain.clone(),
+            payee: resolved.payee.to_string(),
+            token: resolved.asset.clone(),
+            amount: amount.clone(),
+            memo: memo.clone(),
+            description: resolved.description.clone(),
+        };
+        let payment = self.execute(request, Some(req_id), dry_run).await?;
+        let receipt = crate::x402::build_receipt(
+            &resolved,
+            &asset.symbol,
+            asset.decimals,
+            &self.cluster,
+            &self.address(),
+            &memo,
+            &payment,
+        );
+        let op = &payment["operation"];
+        let payment_header = match (op["signature"].as_str(), op["status"].as_str()) {
+            (
+                Some(sig),
+                Some("submitted" | "processed" | "confirmed" | "finalized"),
+            ) => Some(crate::x402::encode_payment_header(
+                &resolved,
+                &self.address(),
+                sig,
+                op["slot"].as_i64(),
+                receipt["receipt_id"].as_str().unwrap_or_default(),
+            )),
+            _ => None,
+        };
+        let http_response = match (dry_run, http.as_ref(), payment_header.as_deref()) {
+            (false, Some(call), Some(header)) => {
+                Some(crate::x402::retry_with_payment_header(call, header).await?)
+            }
+            _ => None,
+        };
+        let trusted = self.payee_is_trusted(&resolved.payee.to_string()).await?;
+        Ok(json!({
+            "x402": {
+                "resource_url": resolved.resource_url,
+                "domain": resolved.domain,
+                "description": resolved.description,
+                "network": resolved.network,
+                "payee": resolved.payee.to_string(),
+                "asset": resolved.accepted.asset,
+                "symbol": asset.symbol,
+                "amount_atomic": resolved.amount_atomic.to_string(),
+                "amount": amount,
+                "memo": memo,
+            },
+            "payment": payment,
+            "receipt": receipt,
+            "payment_header": payment_header,
+            "http_response": http_response,
+            "counterparty_trusted": trusted,
+        }))
+    }
+
+    /// Verify a signed invoice, `manus.receipt.v1`, operation receipt, or local `op_`/`inv_` ID.
+    pub async fn verify(&self, target: &Value, offline: bool) -> anyhow::Result<Value> {
+        let resolved_doc = match target.as_str() {
+            Some(text) if text.starts_with("op_") => self.operation(text).await?,
+            Some(text) if text.starts_with("inv_") => {
+                let row = self
+                    .store
+                    .invoice(text)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("unknown invoice {text}"))?;
+                serde_json::from_str(&row.document_json)?
+            }
+            Some(text) => serde_json::from_str(text).map_err(|error| {
+                anyhow::anyhow!("verify target must be JSON, an op_ id, or an inv_ id: {error}")
+            })?,
+            None => target.clone(),
+        };
+        let rpc = if offline {
+            None
+        } else {
+            Some((&self.rpc, self.cluster.as_str()))
+        };
+        crate::verify::verify_document(&resolved_doc, rpc).await
+    }
+
+    /// Fetch a live swap quote (Jupiter on mainnet), inspect both tokens' on-chain safety
+    /// (mint/freeze authority, Token-2022 transfer fees/hooks), and evaluate budget & trading guards.
+    /// If `kelly_fraction` (e.g. from AIPricePatterns MCP) is passed, also computes a bankroll-aware
+    /// SOL position size bounded by the wallet's live SOL balance and remaining `convert_sol` budget.
+    pub async fn quote(
+        &self,
+        from: &str,
+        to: &str,
+        amount: &str,
+        slippage_bps: Option<u16>,
+        kelly_fraction: Option<f64>,
+    ) -> anyhow::Result<Value> {
+        let input = tx::resolve_asset(&self.rpc, from, &self.cluster).await?;
+        let output = tx::resolve_asset(&self.rpc, to, &self.cluster).await?;
+        let input_safety = crate::trading::inspect_asset_safety(&self.rpc, &input).await?;
+        let output_safety = crate::trading::inspect_asset_safety(&self.rpc, &output).await?;
+        let budget = self.budget().await?;
+        let spent = self.store.spent_last_day(None).await?;
+        let remaining_daily_lamports = budget.convert_sol.daily.saturating_sub(spent.convert_sol);
+
+        let kelly_sizing = if let Some(kf) = kelly_fraction {
+            let sol_lamports = self.rpc.get_balance(&self.address()).await.unwrap_or(0);
+            let recommended_lamports = crate::trading::compute_kelly_size_lamports(
+                kf,
+                sol_lamports,
+                budget.convert_sol.per_op,
+                remaining_daily_lamports,
+            );
+            Some(json!({
+                "kelly_fraction": kf,
+                "wallet_sol_balance": format_units(sol_lamports, 9),
+                "remaining_daily_convert_sol": format_units(remaining_daily_lamports, 9),
+                "max_per_op_convert_sol": format_units(budget.convert_sol.per_op, 9),
+                "recommended_sol_amount": format_units(recommended_lamports, 9),
+            }))
+        } else {
+            None
+        };
+
+        let units = if amount.trim().eq_ignore_ascii_case("all") {
+            if input.mint.is_none() {
+                return Err(anyhow::anyhow!(
+                    "'all' is only supported for tokens, not SOL"
+                ));
+            }
+            self.token_balance(&input).await?
+        } else if amount.trim().eq_ignore_ascii_case("kelly") {
+            if input.mint.is_some() {
+                return Err(anyhow::anyhow!(
+                    "'kelly' amount is only supported when swapping from SOL"
+                ));
+            }
+            let kf = kelly_fraction.ok_or_else(|| {
+                anyhow::anyhow!("amount 'kelly' requires passing kelly_fraction (0.0..1.0)")
+            })?;
+            let sol_lamports = self.rpc.get_balance(&self.address()).await?;
+            crate::trading::compute_kelly_size_lamports(
+                kf,
+                sol_lamports,
+                budget.convert_sol.per_op,
+                remaining_daily_lamports,
+            )
+        } else {
+            parse_units(amount, input.decimals)?
+        };
+        if units == 0 {
+            return Err(anyhow::anyhow!("amount must be greater than zero"));
+        }
+
+        let slippage = slippage_bps.unwrap_or(50);
+
+        if self.cluster != "mainnet-beta" {
+            return Ok(json!({
+                "cluster": self.cluster,
+                "quote_available": false,
+                "reason": "Jupiter routing is available on mainnet-beta only; token safety was inspected on the current cluster",
+                "from": {
+                    "symbol": input.symbol,
+                    "mint": input.mint_or_wsol(),
+                    "amount": format_units(units, input.decimals),
+                    "amount_atomic": units.to_string(),
+                    "safety": input_safety,
+                },
+                "to": {
+                    "symbol": output.symbol,
+                    "mint": output.mint_or_wsol(),
+                    "safety": output_safety,
+                },
+                "kelly_sizing": kelly_sizing,
+            }));
+        }
+
+        if input.mint_or_wsol() == output.mint_or_wsol() {
+            return Err(anyhow::anyhow!("input and output tokens are the same"));
+        }
+
+        let fee_account = tx::fee_account_for(&output);
+        let fee_bps = match self
+            .rpc
+            .get_account_with_commitment(&fee_account, CommitmentConfig::confirmed())
+            .await
+        {
+            Ok(response) if response.value.is_some() => tx::PLATFORM_FEE_BPS,
+            _ => 0,
+        };
+        let quote = self
+            .jupiter
+            .quote(
+                &input.mint_or_wsol(),
+                &output.mint_or_wsol(),
+                units,
+                slippage,
+                fee_bps,
+            )
+            .await?;
+
+        let input_value_lamports = if input.mint.is_none() {
+            units
+        } else if output.mint.is_none() {
+            quote.out_amount
+        } else {
+            self.jupiter
+                .quote(&input.mint_or_wsol(), SOL_MINT, units, 100, 0)
+                .await
+                .map(|q| q.out_amount)
+                .unwrap_or(0)
+        };
+
+        let mut extra_reasons = Vec::new();
+        if slippage > budget.max_slippage_bps {
+            extra_reasons.push(format!(
+                "slippage {slippage} bps exceeds the agent limit of {} bps",
+                budget.max_slippage_bps
+            ));
+        }
+        let impact_percent = quote.price_impact_pct * 100.0;
+        if impact_percent > MAX_PRICE_IMPACT_PCT {
+            extra_reasons.push(format!(
+                "price impact {impact_percent:.2}% is above {MAX_PRICE_IMPACT_PCT}%"
+            ));
+        }
+        if budget.require_allowed_tokens
+            && !crate::trading::token_is_allowed(&budget.allowed_tokens, &output, &self.cluster)
+        {
+            extra_reasons.push(format!(
+                "output token {} ({}) is not in allowed_tokens",
+                output.symbol,
+                output.mint_or_wsol()
+            ));
+        }
+        extra_reasons.extend(output_safety.approval_reasons.clone());
+        if budget.swap_cooldown_secs > 0 {
+            if let Some(elapsed) = self.store.last_conversion_age_secs(None).await? {
+                if elapsed < budget.swap_cooldown_secs {
+                    extra_reasons.push(format!(
+                        "swap cooldown active ({elapsed}s elapsed, minimum {}s)",
+                        budget.swap_cooldown_secs
+                    ));
+                }
+            }
+        }
+        if budget.max_daily_loss_sol > 0
+            && !matches!(output.symbol.as_str(), "SOL" | "USDC" | "USDT")
+        {
+            let trades = self.store.committed_trades().await?;
+            let realized_24h = crate::trading::realized_pnl_last_24h_lamports(&trades);
+            if realized_24h < 0
+                && (realized_24h.unsigned_abs() as u64) >= budget.max_daily_loss_sol
+            {
+                extra_reasons.push(format!(
+                    "daily loss circuit breaker active (realized 24h PnL -{} SOL exceeds max_daily_loss_sol {} SOL)",
+                    format_units(realized_24h.unsigned_abs() as u64, 9),
+                    format_units(budget.max_daily_loss_sol, 9)
+                ));
+            }
+        }
+
+        let exposure = Exposure {
+            category: Category::Convert,
+            sol_out: input_value_lamports,
+            fees: 0,
+            token_out: None,
+            recipient: None,
+        };
+        let decision = merge(decide(&budget, &spent, &exposure), &extra_reasons);
+
+        let in_whole = (units as f64) / 10f64.powi(input.decimals as i32);
+        let out_whole = (quote.out_amount as f64) / 10f64.powi(output.decimals as i32);
+        let rate = if in_whole > 0.0 {
+            out_whole / in_whole
+        } else {
+            0.0
+        };
+
+        Ok(json!({
+            "cluster": self.cluster,
+            "quote_available": true,
+            "from": {
+                "symbol": input.symbol,
+                "mint": input.mint_or_wsol(),
+                "amount": format_units(units, input.decimals),
+                "amount_atomic": units.to_string(),
+                "decimals": input.decimals,
+                "safety": input_safety,
+            },
+            "to": {
+                "symbol": output.symbol,
+                "mint": output.mint_or_wsol(),
+                "estimated_out": format_units(quote.out_amount, output.decimals),
+                "estimated_out_atomic": quote.out_amount.to_string(),
+                "min_out": format_units(quote.min_out_amount, output.decimals),
+                "min_out_atomic": quote.min_out_amount.to_string(),
+                "decimals": output.decimals,
+                "safety": output_safety,
+            },
+            "rate": format!("{rate:.8}"),
+            "slippage_bps": slippage,
+            "price_impact_pct": (impact_percent * 1000.0).round() / 1000.0,
+            "route": quote.route,
+            "platform_fee": {
+                "bps": quote.fee_bps,
+                "amount": format_units(quote.platform_fee, output.decimals),
+                "symbol": output.symbol,
+            },
+            "sol_valuation": format_units(input_value_lamports, 9),
+            "decision": decision,
+            "kelly_sizing": kelly_sizing,
+        }))
+    }
+
+    /// Trading portfolio: on-chain balances, per-token cost basis, average entry price,
+    /// realized/unrealized PnL in SOL, strategy performance by tag, and active triggers.
+    pub async fn portfolio(&self) -> anyhow::Result<Value> {
+        self.reconcile_unsettled().await?;
+        let wallet = self.address();
+        let sol_lamports = self.rpc.get_balance(&wallet).await?;
+
+        let mut onchain_tokens: Vec<(String, String, u64, u8)> = Vec::new();
+        for program in [spl_token::id(), spl_token_2022::id()] {
+            let accounts = self
+                .rpc
+                .get_token_accounts_by_owner(&wallet, TokenAccountsFilter::ProgramId(program))
+                .await
+                .unwrap_or_default();
+            for keyed in accounts {
+                if let solana_account_decoder::UiAccountData::Json(parsed) = keyed.account.data {
+                    let info = &parsed.parsed["info"];
+                    let mint = info["mint"].as_str().unwrap_or_default().to_string();
+                    let amount = &info["tokenAmount"];
+                    let atomic: u64 = amount["amount"]
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    if atomic == 0 {
+                        continue;
+                    }
+                    let decimals = amount["decimals"].as_u64().unwrap_or(0) as u8;
+                    let symbol = tx::symbol_for_mint(&mint)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            Pubkey::from_str(&mint)
+                                .map(|pk| tx::short(&pk))
+                                .unwrap_or_else(|_| mint.clone())
+                        });
+                    onchain_tokens.push((mint, symbol, atomic, decimals));
+                }
+            }
+        }
+
+        let mut valuations = std::collections::BTreeMap::new();
+        if self.cluster == "mainnet-beta" {
+            for (mint, _sym, atomic, _dec) in &onchain_tokens {
+                if *atomic > 0 && mint != SOL_MINT {
+                    if let Ok(q) = self.jupiter.quote(mint, SOL_MINT, *atomic, 100, 0).await {
+                        valuations.insert(mint.clone(), q.out_amount);
+                    }
+                }
+            }
+        }
+
+        let trades = self.store.committed_trades().await?;
+        let (positions, realized_lamports, unrealized_lamports) =
+            crate::trading::compute_positions(&trades, &onchain_tokens, &valuations);
+        let performance = crate::trading::compute_strategy_performance(&trades);
+        let active_triggers = self.store.list_triggers(true).await.unwrap_or_default();
+
+        let tokens_sol_lamports: u64 = valuations.values().copied().sum();
+        let total_portfolio_lamports = sol_lamports.saturating_add(tokens_sol_lamports);
+
+        Ok(json!({
+            "address": wallet.to_string(),
+            "cluster": self.cluster,
+            "sol_balance": format_units(sol_lamports, 9),
+            "tokens_value_sol": if self.cluster == "mainnet-beta" {
+                Value::String(format_units(tokens_sol_lamports, 9))
+            } else {
+                Value::Null
+            },
+            "total_portfolio_value_sol": if self.cluster == "mainnet-beta" {
+                Value::String(format_units(total_portfolio_lamports, 9))
+            } else {
+                Value::String(format_units(sol_lamports, 9))
+            },
+            "realized_pnl_sol": crate::trading::format_signed_lamports(realized_lamports),
+            "unrealized_pnl_sol": crate::trading::format_signed_lamports(unrealized_lamports),
+            "total_trades": trades.len(),
+            "performance": performance,
+            "positions": positions,
+            "active_triggers": active_triggers,
+        }))
+    }
+
+    /// Execute a swap and optionally attach an automatic Take-Profit / Stop-Loss / Trailing-Stop
+    /// exit trigger (`to -> from`) on the exact received output token amount.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn swap_with_bracket(
+        &self,
+        from: &str,
+        to: &str,
+        amount: &str,
+        slippage_bps: Option<u16>,
+        take_profit_pct: Option<f64>,
+        stop_loss_pct: Option<f64>,
+        trailing_stop_bps: Option<u16>,
+        tag: Option<String>,
+        request_id: Option<String>,
+        dry_run: bool,
+    ) -> anyhow::Result<Value> {
+        let has_bracket =
+            take_profit_pct.is_some() || stop_loss_pct.is_some() || trailing_stop_bps.is_some();
+        if let Some(tp) = take_profit_pct {
+            if !tp.is_finite() || tp <= 0.0 {
+                return Err(anyhow::anyhow!("take_profit_pct must be > 0"));
+            }
+        }
+        if let Some(sl) = stop_loss_pct {
+            let drop = sl.abs();
+            if !drop.is_finite() || drop <= 0.0 || drop >= 100.0 {
+                return Err(anyhow::anyhow!("stop_loss_pct must be between 0 and 100"));
+            }
+        }
+        if let Some(bps) = trailing_stop_bps {
+            if bps == 0 || bps >= 10_000 {
+                return Err(anyhow::anyhow!(
+                    "trailing_stop_bps must be between 1 and 9999"
+                ));
+            }
+        }
+
+        let clean_tag = tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let req = Request::Swap {
+            from: from.to_string(),
+            to: to.to_string(),
+            amount: amount.to_string(),
+            slippage_bps,
+            tag: clean_tag.clone(),
+        };
+        let mut res = self.execute(req, request_id, dry_run).await?;
+
+        if !has_bracket {
+            return Ok(res);
+        }
+
+        if dry_run {
+            res["bracket_trigger_preview"] = json!({
+                "exit_pair": format!("{to} -> {from}"),
+                "take_profit_pct": take_profit_pct,
+                "stop_loss_pct": stop_loss_pct,
+                "trailing_stop_bps": trailing_stop_bps,
+                "tag": clean_tag,
+            });
+            return Ok(res);
+        }
+
+        let op_id = res["operation"]["id"].as_str().unwrap_or_default().to_string();
+        let op_status = res["operation"]["status"].as_str().unwrap_or_default();
+        if matches!(
+            op_status,
+            "submitted" | "processed" | "confirmed" | "finalized"
+        ) {
+            let trades = self.store.committed_trades().await?;
+            if let Some(trade) = trades.iter().find(|t| t.operation_id == op_id) {
+                let in_whole =
+                    (trade.input_amount as f64) / 10f64.powi(trade.input_decimals as i32);
+                let out_whole =
+                    (trade.output_amount as f64) / 10f64.powi(trade.output_decimals as i32);
+                if in_whole > 0.0 && out_whole > 0.0 {
+                    // Exit direction is `output -> input`, so 1 output unit = (in_whole / out_whole) input units.
+                    let exit_entry_rate = in_whole / out_whole;
+                    let tp_rate = take_profit_pct.map(|pct| exit_entry_rate * (1.0 + pct / 100.0));
+                    let sl_rate =
+                        stop_loss_pct.map(|pct| exit_entry_rate * (1.0 - pct.abs() / 100.0));
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let record = crate::store::TriggerRecord {
+                        id: format!("trg_{}", uuid::Uuid::new_v4().simple()),
+                        from_token: to.trim().to_string(),
+                        to_token: from.trim().to_string(),
+                        amount: format_units(trade.output_amount, trade.output_decimals),
+                        slippage_bps: slippage_bps.unwrap_or(50),
+                        take_profit_rate: tp_rate,
+                        stop_loss_rate: sl_rate,
+                        trailing_stop_bps,
+                        peak_rate: Some(exit_entry_rate),
+                        tag: clean_tag,
+                        status: "active".to_string(),
+                        triggered_reason: None,
+                        operation_id: None,
+                        created_at: now.clone(),
+                        updated_at: now,
+                    };
+                    self.store.put_trigger(&record).await?;
+                    res["bracket_trigger"] = serde_json::to_value(&record)?;
+                }
+            }
+        }
+        Ok(res)
+    }
+
+    /// Create a local Take-Profit, Stop-Loss, OCO, or Trailing-Stop trigger order.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_trigger(
+        &self,
+        from: &str,
+        to: &str,
+        amount: &str,
+        slippage_bps: Option<u16>,
+        take_profit_rate: Option<f64>,
+        stop_loss_rate: Option<f64>,
+        take_profit_pct: Option<f64>,
+        stop_loss_pct: Option<f64>,
+        trailing_stop_bps: Option<u16>,
+        tag: Option<String>,
+    ) -> anyhow::Result<Value> {
+        let input = tx::resolve_asset(&self.rpc, from, &self.cluster).await?;
+        let output = tx::resolve_asset(&self.rpc, to, &self.cluster).await?;
+        if input.mint_or_wsol() == output.mint_or_wsol() {
+            return Err(anyhow::anyhow!("input and output tokens are the same"));
+        }
+        if !amount.trim().eq_ignore_ascii_case("all") {
+            let _ = parse_units(amount, input.decimals)?;
+        }
+
+        let mut tp = take_profit_rate;
+        let mut sl = stop_loss_rate;
+        let mut reference_rate = None;
+
+        if (tp.is_none() && take_profit_pct.is_some())
+            || (sl.is_none() && stop_loss_pct.is_some())
+            || (trailing_stop_bps.is_some() && self.cluster == "mainnet-beta")
+        {
+            if let Ok(q) = self.quote(from, to, amount, slippage_bps, None).await {
+                if let Some(current_rate) = q["rate"].as_str().and_then(|s| s.parse::<f64>().ok()) {
+                    reference_rate = Some(current_rate);
+                }
+            }
+            if (tp.is_none() && take_profit_pct.is_some())
+                || (sl.is_none() && stop_loss_pct.is_some())
+            {
+                let current_rate = reference_rate.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "percentage trigger offsets require a live mainnet Jupiter quote; pass explicit take_profit_rate / stop_loss_rate on {}",
+                        self.cluster
+                    )
+                })?;
+                if tp.is_none() {
+                    if let Some(pct) = take_profit_pct {
+                        if pct <= 0.0 {
+                            return Err(anyhow::anyhow!("take_profit_pct must be > 0"));
+                        }
+                        tp = Some(current_rate * (1.0 + pct / 100.0));
+                    }
+                }
+                if sl.is_none() {
+                    if let Some(pct) = stop_loss_pct {
+                        let drop = pct.abs();
+                        if drop <= 0.0 || drop >= 100.0 {
+                            return Err(anyhow::anyhow!("stop_loss_pct must be between 0 and 100"));
+                        }
+                        sl = Some(current_rate * (1.0 - drop / 100.0));
+                    }
+                }
+            }
+        }
+
+        crate::trading::validate_trigger_rates(tp, sl, trailing_stop_bps)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = crate::store::TriggerRecord {
+            id: format!("trg_{}", uuid::Uuid::new_v4().simple()),
+            from_token: from.trim().to_string(),
+            to_token: to.trim().to_string(),
+            amount: amount.trim().to_string(),
+            slippage_bps: slippage_bps.unwrap_or(50),
+            take_profit_rate: tp,
+            stop_loss_rate: sl,
+            trailing_stop_bps,
+            peak_rate: reference_rate,
+            tag: tag
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            status: "active".to_string(),
+            triggered_reason: None,
+            operation_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.store.put_trigger(&record).await?;
+        Ok(json!({
+            "trigger": record,
+            "reference_rate": reference_rate,
+            "pair": format!("{} -> {}", input.symbol, output.symbol),
+        }))
+    }
+
+    pub async fn list_triggers(&self, active_only: bool) -> anyhow::Result<Value> {
+        let triggers = self.store.list_triggers(active_only).await?;
+        Ok(json!({ "triggers": triggers }))
+    }
+
+    pub async fn cancel_trigger(&self, id: &str) -> anyhow::Result<Value> {
+        let updated = self
+            .store
+            .cancel_trigger(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown trigger {id}"))?;
+        Ok(json!({ "trigger": updated }))
+    }
+
+    /// Evaluate all active Take-Profit / Stop-Loss / Trailing-Stop triggers against live Jupiter quotes
+    /// and automatically execute any triggered swap inside the wallet's budget.
+    pub async fn evaluate_triggers(&self) -> anyhow::Result<Value> {
+        let active = self.store.list_triggers(true).await?;
+        if active.is_empty() || self.cluster != "mainnet-beta" {
+            return Ok(json!({
+                "checked": active.len(),
+                "triggered": [],
+            }));
+        }
+
+        let mut fired = Vec::new();
+        for trg in active {
+            let Ok(q) = self
+                .quote(
+                    &trg.from_token,
+                    &trg.to_token,
+                    &trg.amount,
+                    Some(trg.slippage_bps),
+                    None,
+                )
+                .await
+            else {
+                continue;
+            };
+            let Some(current_rate) = q["rate"].as_str().and_then(|s| s.parse::<f64>().ok()) else {
+                continue;
+            };
+            let (updated_peak, reason) = crate::trading::evaluate_trigger_condition(
+                trg.take_profit_rate,
+                trg.stop_loss_rate,
+                trg.trailing_stop_bps,
+                trg.peak_rate,
+                current_rate,
+            );
+            if let Some(new_peak) = updated_peak {
+                let _ = self.store.update_trigger_peak(&trg.id, new_peak).await;
+            }
+            let Some(reason) = reason else {
+                continue;
+            };
+            if !self.store.claim_trigger(&trg.id, &reason).await? {
+                continue;
+            }
+            let swap_req = Request::Swap {
+                from: trg.from_token.clone(),
+                to: trg.to_token.clone(),
+                amount: trg.amount.clone(),
+                slippage_bps: Some(trg.slippage_bps),
+                tag: trg.tag.clone(),
+            };
+            match self.execute(swap_req, Some(trg.id.clone()), false).await {
+                Ok(res) => {
+                    let op_id = res["operation"]["id"].as_str().map(str::to_string);
+                    let op_status = res["operation"]["status"].as_str().unwrap_or("unknown");
+                    let final_status = if matches!(op_status, "denied" | "failed" | "expired") {
+                        "failed"
+                    } else {
+                        "executed"
+                    };
+                    let _ = self
+                        .store
+                        .finish_trigger(&trg.id, final_status, op_id.as_deref(), Some(&reason))
+                        .await;
+                    self.gbrain.emit(
+                        "wallet.trigger",
+                        format!("Manus trigger {} {final_status}: {reason}", trg.id),
+                        2,
+                    );
+                    fired.push(json!({
+                        "trigger_id": trg.id,
+                        "status": final_status,
+                        "reason": reason,
+                        "operation": res["operation"],
+                    }));
+                }
+                Err(err) => {
+                    let err_msg = format!("{reason}; execution error: {err}");
+                    let _ = self
+                        .store
+                        .finish_trigger(&trg.id, "failed", None, Some(&err_msg))
+                        .await;
+                    fired.push(json!({
+                        "trigger_id": trg.id,
+                        "status": "failed",
+                        "error": err_msg,
+                    }));
+                }
+            }
+        }
+
+        Ok(json!({
+            "checked": fired.len(),
+            "triggered": fired,
+        }))
+    }
+
     /// Inspect and simulate a prepared transaction, then measure its exposure.
     async fn evaluate(&self, prepared: &Prepared) -> anyhow::Result<(SimulatedEffects, Exposure)> {
         let wallet = self.address();
@@ -1280,7 +2159,9 @@ impl AgentWallet {
                 "Every operation is simulated first and judged by its real balance changes.",
                 "Use request_id to make retries safe; the same id never pays twice.",
                 "Transfers are free. Swaps, stake and unstake carry a 0.1% Manus fee, shown in the summary.",
-                "create_invoice bills another agent. pay_invoice settles a signed bill. The first payment to a new agent asks you, then that address is trusted inside the budget."
+                "create_invoice bills another agent. pay_invoice settles a signed bill. The first payment to a new agent asks you, then that address is trusted inside the budget.",
+                "pay_x402 inspects and settles an HTTP 402 (x402 v2) challenge and returns a manus.receipt.v1 plus a payment_header proof. verify checks any invoice or receipt on-chain.",
+                "For trading: call market_signals (AIPricePatterns), quote (price impact + token mint/freeze safety), and portfolio (positions + PnL) before executing swap."
             ]
         }))
     }
@@ -1609,6 +2490,10 @@ pub fn budget_view(
         "trusted_recipients": budget.trusted_recipients,
         "require_trusted_recipients": budget.require_trusted_recipients,
         "max_slippage_bps": budget.max_slippage_bps,
+        "allowed_tokens": budget.allowed_tokens,
+        "require_allowed_tokens": budget.require_allowed_tokens,
+        "swap_cooldown_secs": budget.swap_cooldown_secs,
+        "max_daily_loss_sol": format_units(budget.max_daily_loss_sol, 9),
     })
 }
 

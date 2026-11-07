@@ -650,3 +650,66 @@ async fn waiting_for_approval_does_not_block_other_spending() {
     assert_eq!(received, 600_000_000);
     let _ = std::fs::remove_file(db);
 }
+
+#[tokio::test]
+#[ignore]
+async fn x402_payment_and_receipt_verification_through_mcp_tools() {
+    let mut budget = Budget::default_for_cluster("localnet");
+    budget.send_sol = Limits {
+        per_op: 500_000_000,
+        daily: 1_000_000_000,
+    };
+    let (payer, payer_db) =
+        wallet_with_approver(budget, Arc::new(SlowApprover(std::time::Duration::from_millis(10)))).await;
+    let merchant = Keypair::new().pubkey();
+
+    let challenge = serde_json::json!({
+        "x402Version": 2,
+        "resource": {
+            "url": "https://api.example.com/v1/alpha",
+            "description": "Alpha signal feed"
+        },
+        "accepts": [{
+            "scheme": "exact",
+            "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+            "amount": "100000000",
+            "asset": "SOL",
+            "payTo": merchant.to_string(),
+            "maxTimeoutSeconds": 120
+        }],
+        "extensions": {
+            "payment-identifier": { "info": { "id": "x402_req_1" } }
+        }
+    });
+
+    // First payment to an untrusted x402 merchant asks the approver and then trusts the address.
+    let paid = mcp::call(
+        &payer,
+        "pay_x402",
+        &serde_json::json!({ "challenge": challenge }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(paid["counterparty_trusted"], true, "{paid}");
+    assert!(paid["payment_header"].is_string(), "{paid}");
+    assert_eq!(paid["receipt"]["schema_version"], "manus.receipt.v1");
+
+    // Wait for finality and verify the emitted manus.receipt.v1 through the MCP verify tool.
+    let receipt = paid["receipt"].clone();
+    for _ in 0..40 {
+        let verified = mcp::call(
+            &payer,
+            "verify",
+            &serde_json::json!({ "document": receipt }),
+        )
+        .await
+        .unwrap();
+        if verified["verified"] == true {
+            let _ = std::fs::remove_file(payer_db.with_extension("spend.lock"));
+            let _ = std::fs::remove_file(payer_db);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("x402 receipt never verified as finalized on localnet");
+}

@@ -435,7 +435,7 @@ async fn fetch_match(
     }))
 }
 
-fn token_deltas(meta: &solana_transaction_status::UiTransactionStatusMeta) -> Vec<TokenDelta> {
+pub fn token_deltas(meta: &solana_transaction_status::UiTransactionStatusMeta) -> Vec<TokenDelta> {
     let mut totals: Vec<(Pubkey, Pubkey, i128)> = Vec::new();
     let apply = |totals: &mut Vec<(Pubkey, Pubkey, i128)>,
                  balances: &OptionSerializer<
@@ -474,7 +474,7 @@ fn token_deltas(meta: &solana_transaction_status::UiTransactionStatusMeta) -> Ve
         .collect()
 }
 
-fn has_memo(tx: &VersionedTransaction, invoice_id: &str) -> bool {
+pub fn has_memo(tx: &VersionedTransaction, invoice_id: &str) -> bool {
     let keys = tx.message.static_account_keys();
     tx.message.instructions().iter().any(|ix| {
         keys.get(ix.program_id_index as usize)
@@ -483,7 +483,7 @@ fn has_memo(tx: &VersionedTransaction, invoice_id: &str) -> bool {
     })
 }
 
-fn sol_paid(
+pub fn sol_paid(
     tx: &VersionedTransaction,
     pre: &[u64],
     post: &[u64],
@@ -532,7 +532,7 @@ fn sol_paid(
     })
 }
 
-fn token_paid(
+pub fn token_paid(
     tx: &VersionedTransaction,
     deltas: &[TokenDelta],
     payee: &Pubkey,

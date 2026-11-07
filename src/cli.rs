@@ -59,6 +59,39 @@ pub enum AgentAction {
         trust: Vec<String>,
         #[arg(long)]
         max_slippage_bps: Option<u16>,
+        /// Allow swapping into this token (symbol or mint) without approval (repeatable)
+        #[arg(long = "allow-token")]
+        allow_token: Vec<String>,
+        /// Remove a token from allowed_tokens (repeatable)
+        #[arg(long = "remove-allowed-token")]
+        remove_allowed_token: Vec<String>,
+        /// Require output tokens of swaps to be in allowed_tokens (true/false)
+        #[arg(long)]
+        require_allowed_tokens: Option<bool>,
+        /// Minimum seconds between automatic swaps without Touch ID
+        #[arg(long)]
+        swap_cooldown_secs: Option<u64>,
+        /// Daily realized-loss circuit breaker in SOL (0 to disable)
+        #[arg(long)]
+        max_daily_loss_sol: Option<String>,
+    },
+    /// Get a live swap quote, price impact, token safety report, budget decision, and optional Kelly sizing
+    Quote {
+        from: String,
+        to: String,
+        amount: String,
+        #[arg(long)]
+        slippage_bps: Option<u16>,
+        /// Optional Kelly fraction (0.0..1.0) to size SOL trade against wallet balance and budget
+        #[arg(long)]
+        kelly_fraction: Option<f64>,
+    },
+    /// Show trading portfolio, token holdings, cost basis, realized/unrealized PnL, and strategy win rate
+    Portfolio,
+    /// Manage and watch autonomous Take-Profit / Stop-Loss / OCO / Trailing-Stop exit triggers
+    Trigger {
+        #[command(subcommand)]
+        action: TriggerAction,
     },
     /// Switch between devnet and mainnet-beta; asks for Touch ID
     Network {
@@ -72,6 +105,73 @@ pub enum AgentAction {
     Invoice {
         #[command(subcommand)]
         action: InvoiceAction,
+    },
+    /// Inspect and pay HTTP 402 (x402 v2) payment challenges
+    X402 {
+        #[command(subcommand)]
+        action: X402Action,
+    },
+    /// Verify a signed invoice, manus.receipt.v1, operation receipt, or op_/inv_ ID
+    Verify {
+        /// JSON string, @path/to/file.json, file path, op_ ID, or inv_ ID
+        target: String,
+        /// Only check cryptographic signatures and schema without calling Solana RPC
+        #[arg(long)]
+        offline: bool,
+        /// Override cluster (devnet, localnet, mainnet-beta)
+        #[arg(long)]
+        cluster: Option<String>,
+        /// Override Solana RPC URL
+        #[arg(long)]
+        rpc_url: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TriggerAction {
+    /// Create a Take-Profit, Stop-Loss, or OCO exit trigger
+    Create {
+        from: String,
+        to: String,
+        amount: String,
+        #[arg(long)]
+        slippage_bps: Option<u16>,
+        #[arg(long)]
+        take_profit_rate: Option<f64>,
+        #[arg(long)]
+        stop_loss_rate: Option<f64>,
+        #[arg(long)]
+        take_profit_pct: Option<f64>,
+        #[arg(long)]
+        stop_loss_pct: Option<f64>,
+        #[arg(long)]
+        trailing_stop_bps: Option<u16>,
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// List active (or --all) triggers
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Cancel an active trigger by ID
+    Cancel { id: String },
+    /// Continuously watch and execute active triggers in the foreground
+    Watch {
+        #[arg(long, default_value_t = 15)]
+        interval_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum X402Action {
+    /// Pay an x402 v2 challenge (JSON, base64 PAYMENT-REQUIRED header, or @path)
+    Pay {
+        challenge: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -149,6 +249,11 @@ pub async fn run(name: &str, action: &AgentAction) -> anyhow::Result<()> {
             convert_daily,
             trust,
             max_slippage_bps,
+            allow_token,
+            remove_allowed_token,
+            require_allowed_tokens,
+            swap_cooldown_secs,
+            max_daily_loss_sol,
         } => {
             let wallet = agent_wallet::open(name).await?;
             let mut budget = wallet.budget().await?;
@@ -172,11 +277,108 @@ pub async fn run(name: &str, action: &AgentAction) -> anyhow::Result<()> {
             if let Some(bps) = max_slippage_bps {
                 budget.max_slippage_bps = *bps;
             }
+            for token in allow_token {
+                let trimmed = token.trim();
+                if !trimmed.is_empty() && !budget.allowed_tokens.iter().any(|t| t == trimmed) {
+                    budget.allowed_tokens.push(trimmed.to_string());
+                }
+            }
+            if !remove_allowed_token.is_empty() {
+                budget
+                    .allowed_tokens
+                    .retain(|t| !remove_allowed_token.iter().any(|r| r == t));
+            }
+            if let Some(flag) = require_allowed_tokens {
+                budget.require_allowed_tokens = *flag;
+            }
+            if let Some(secs) = swap_cooldown_secs {
+                budget.swap_cooldown_secs = *secs;
+            }
+            if let Some(loss_sol) = max_daily_loss_sol {
+                if loss_sol.trim() == "0" {
+                    budget.max_daily_loss_sol = 0;
+                } else {
+                    budget.max_daily_loss_sol = parse_units(loss_sol, 9)?;
+                }
+            }
             print(
                 wallet
                     .change_budget(budget, "changed from the terminal")
                     .await?,
             )
+        }
+        AgentAction::Quote {
+            from,
+            to,
+            amount,
+            slippage_bps,
+            kelly_fraction,
+        } => {
+            let wallet = agent_wallet::open(name).await?;
+            print(
+                wallet
+                    .quote(from, to, amount, *slippage_bps, *kelly_fraction)
+                    .await?,
+            )
+        }
+        AgentAction::Portfolio => {
+            let wallet = agent_wallet::open(name).await?;
+            print(wallet.portfolio().await?)
+        }
+        AgentAction::Trigger { action } => {
+            let wallet = agent_wallet::open(name).await?;
+            match action {
+                TriggerAction::Create {
+                    from,
+                    to,
+                    amount,
+                    slippage_bps,
+                    take_profit_rate,
+                    stop_loss_rate,
+                    take_profit_pct,
+                    stop_loss_pct,
+                    trailing_stop_bps,
+                    tag,
+                } => print(
+                    wallet
+                        .create_trigger(
+                            from,
+                            to,
+                            amount,
+                            *slippage_bps,
+                            *take_profit_rate,
+                            *stop_loss_rate,
+                            *take_profit_pct,
+                            *stop_loss_pct,
+                            *trailing_stop_bps,
+                            tag.clone(),
+                        )
+                        .await?,
+                ),
+                TriggerAction::List { all } => print(wallet.list_triggers(!all).await?),
+                TriggerAction::Cancel { id } => print(wallet.cancel_trigger(id).await?),
+                TriggerAction::Watch { interval_secs } => {
+                    eprintln!(
+                        "manus trigger watcher started for {} on {} (every {}s)",
+                        wallet.address(),
+                        wallet.cluster,
+                        interval_secs
+                    );
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                        (*interval_secs).max(5),
+                    ));
+                    loop {
+                        ticker.tick().await;
+                        let res = wallet.evaluate_triggers().await?;
+                        if res["triggered"]
+                            .as_array()
+                            .is_some_and(|arr| !arr.is_empty())
+                        {
+                            print(res)?;
+                        }
+                    }
+                }
+            }
         }
         AgentAction::Network { cluster, rpc_url } => {
             let network = NetworkConfig {
@@ -202,7 +404,133 @@ pub async fn run(name: &str, action: &AgentAction) -> anyhow::Result<()> {
             Ok(())
         }
         AgentAction::Invoice { action } => invoice_command(name, action).await,
+        AgentAction::X402 { action } => x402_command(name, action).await,
+        AgentAction::Verify {
+            target,
+            offline,
+            cluster,
+            rpc_url,
+        } => {
+            run_verify(
+                name,
+                target,
+                *offline,
+                cluster.as_deref(),
+                rpc_url.as_deref(),
+            )
+            .await
+        }
     }
+}
+
+async fn x402_command(name: &str, action: &X402Action) -> anyhow::Result<()> {
+    let wallet = agent_wallet::open(name).await?;
+    match action {
+        X402Action::Pay {
+            challenge,
+            request_id,
+            dry_run,
+        } => {
+            let trimmed_arg = challenge.trim();
+            if trimmed_arg.starts_with("https://") || trimmed_arg.starts_with("http://") {
+                let http = crate::x402::HttpCall {
+                    url: trimmed_arg.to_string(),
+                    method: None,
+                    headers: None,
+                    body: None,
+                };
+                let result = wallet
+                    .pay_x402(None, None, Some(http), request_id.clone(), *dry_run)
+                    .await?;
+                return print(result);
+            }
+            let text = read_input_arg(challenge)?;
+            let trimmed = text.trim();
+            let result = if trimmed.starts_with('{') {
+                let json: serde_json::Value = serde_json::from_str(trimmed)?;
+                wallet
+                    .pay_x402(Some(&json), None, None, request_id.clone(), *dry_run)
+                    .await?
+            } else {
+                wallet
+                    .pay_x402(None, Some(trimmed), None, request_id.clone(), *dry_run)
+                    .await?
+            };
+            print(result)
+        }
+    }
+}
+
+/// Verify an invoice, `manus.receipt.v1`, or operation receipt without needing the wallet keypair.
+pub async fn run_verify(
+    name: &str,
+    target: &str,
+    offline: bool,
+    cluster_override: Option<&str>,
+    rpc_override: Option<&str>,
+) -> anyhow::Result<()> {
+    let trimmed = target.trim();
+    let document: serde_json::Value = if trimmed.starts_with("op_") {
+        let store = crate::store::Store::open(&agent_wallet::store_path(name)).await?;
+        let record = store
+            .get(trimmed)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown operation {trimmed}"))?;
+        serde_json::to_value(record)?
+    } else if trimmed.starts_with("inv_") {
+        let store = crate::store::Store::open(&agent_wallet::store_path(name)).await?;
+        let row = store
+            .invoice(trimmed)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown invoice {trimmed}"))?;
+        serde_json::from_str(&row.document_json)?
+    } else {
+        let text = read_input_arg(trimmed)?;
+        serde_json::from_str(&text)
+            .map_err(|error| anyhow::anyhow!("cannot parse JSON to verify: {error}"))?
+    };
+
+    if offline {
+        let report = crate::verify::verify_document(&document, None).await?;
+        return print(report);
+    }
+
+    let net = NetworkConfig::load(name).unwrap_or(NetworkConfig {
+        cluster: "devnet".into(),
+        rpc_url: NetworkConfig::default_rpc("devnet"),
+    });
+    let inferred_cluster = document
+        .get("cluster")
+        .or_else(|| document.pointer("/invoice/cluster"))
+        .or_else(|| document.pointer("/receipt/cluster"))
+        .and_then(serde_json::Value::as_str);
+    let cluster = match cluster_override.or(inferred_cluster) {
+        Some(c) => validate_cluster(c)?,
+        None => net.cluster.clone(),
+    };
+    let rpc_url = match rpc_override {
+        Some(url) => url.to_string(),
+        None if cluster == net.cluster => net.rpc_url,
+        None => NetworkConfig::default_rpc(&cluster),
+    };
+    let rpc = solana_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
+        rpc_url,
+        solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+    );
+    let report = crate::verify::verify_document(&document, Some((&rpc, &cluster))).await?;
+    print(report)
+}
+
+fn read_input_arg(arg: &str) -> anyhow::Result<String> {
+    if let Some(path) = arg.strip_prefix('@') {
+        return std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("cannot read {path}: {error}"));
+    }
+    if !arg.trim_start().starts_with('{') && std::path::Path::new(arg).is_file() {
+        return std::fs::read_to_string(arg)
+            .map_err(|error| anyhow::anyhow!("cannot read {arg}: {error}"));
+    }
+    Ok(arg.to_string())
 }
 
 async fn invoice_command(name: &str, action: &InvoiceAction) -> anyhow::Result<()> {

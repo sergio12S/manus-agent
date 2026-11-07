@@ -20,7 +20,10 @@ pub mod mcp;
 pub mod mints;
 pub mod secret;
 pub mod store;
+pub mod trading;
 pub mod tx;
+pub mod verify;
+pub mod x402;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
