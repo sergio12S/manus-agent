@@ -247,6 +247,7 @@ pub async fn call(wallet: &AgentWallet, name: &str, args: &Value) -> anyhow::Res
                         .as_u64()
                         .map(|v| v.min(9_999) as u16),
                     text("tag"),
+                    dry_run,
                 )
                 .await
         }
@@ -400,13 +401,13 @@ fn tools() -> Value {
             "name": "wallet_status",
             "description": "Your wallet address, balances, budget, what you spent in the last 24h, and how approvals work. Call this before spending.",
             "inputSchema": { "type": "object", "properties": {} },
-            "annotations": { "readOnlyHint": true }
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true }
         },
         {
             "name": "balances",
             "description": "SOL and token balances of your wallet.",
             "inputSchema": { "type": "object", "properties": {} },
-            "annotations": { "readOnlyHint": true }
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true }
         },
         {
             "name": "send",
@@ -423,7 +424,7 @@ fn tools() -> Value {
                 },
                 "required": ["to", "amount"]
             },
-            "annotations": { "destructiveHint": true }
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true }
         },
         {
             "name": "swap",
@@ -444,7 +445,7 @@ fn tools() -> Value {
                 },
                 "required": ["from", "to", "amount"]
             },
-            "annotations": { "destructiveHint": true }
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true }
         },
         {
             "name": "stake",
@@ -453,7 +454,8 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": { "amount": amount, "request_id": request_id, "dry_run": dry_run },
                 "required": ["amount"]
-            }
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true }
         },
         {
             "name": "unstake",
@@ -462,7 +464,8 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": { "amount": amount, "request_id": request_id, "dry_run": dry_run },
                 "required": ["amount"]
-            }
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true }
         },
         {
             "name": "history",
@@ -471,7 +474,7 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": { "limit": { "type": "integer", "description": "Default 20." } }
             },
-            "annotations": { "readOnlyHint": true }
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true }
         },
         {
             "name": "operation",
@@ -480,7 +483,8 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": { "id": { "type": "string" } },
                 "required": ["id"]
-            }
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": true }
         },
         {
             "name": "create_invoice",
@@ -494,7 +498,8 @@ fn tools() -> Value {
                     "expires_in_hours": { "type": "integer", "description": "1-720. Default 168 (7 days)." }
                 },
                 "required": ["amount", "description"]
-            }
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false }
         },
         {
             "name": "pay_invoice",
@@ -507,7 +512,7 @@ fn tools() -> Value {
                 },
                 "required": ["invoice"]
             },
-            "annotations": { "destructiveHint": true }
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": true }
         },
         {
             "name": "invoice_status",
@@ -519,7 +524,7 @@ fn tools() -> Value {
                 },
                 "required": ["invoice_id"]
             },
-            "annotations": { "readOnlyHint": true }
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true }
         },
         {
             "name": "pay_x402",
@@ -537,7 +542,7 @@ fn tools() -> Value {
                     "dry_run": dry_run
                 }
             },
-            "annotations": { "destructiveHint": true }
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true }
         },
         {
             "name": "verify",
@@ -550,7 +555,7 @@ fn tools() -> Value {
                 },
                 "required": ["document"]
             },
-            "annotations": { "readOnlyHint": true }
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true }
         },
         {
             "name": "quote",
@@ -566,13 +571,13 @@ fn tools() -> Value {
                 },
                 "required": ["from", "to", "amount"]
             },
-            "annotations": { "readOnlyHint": true }
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true }
         },
         {
             "name": "portfolio",
             "description": "Trading portfolio and PnL tracker: SOL and token holdings, live SOL valuation, per-token cost basis, average entry price, realized/unrealized PnL, active triggers, and closed-trade win rate & profit factor broken down by strategy tag.",
             "inputSchema": { "type": "object", "properties": {} },
-            "annotations": { "readOnlyHint": true }
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true }
         },
         {
             "name": "create_trigger",
@@ -589,10 +594,12 @@ fn tools() -> Value {
                     "take_profit_pct": { "type": "number", "description": "Optional percentage gain above current live Jupiter rate (e.g. 5.0 for +5%)." },
                     "stop_loss_pct": { "type": "number", "description": "Optional percentage drop below current live Jupiter rate (e.g. 2.5 for -2.5%)." },
                     "trailing_stop_bps": { "type": "integer", "description": "Optional trailing stop distance in bps below the highest observed rate (e.g. 200 for 2.0%)." },
-                    "tag": { "type": "string", "description": "Optional strategy tag for PnL attribution when triggered." }
+                    "tag": { "type": "string", "description": "Optional strategy tag for PnL attribution when triggered." },
+                    "dry_run": dry_run
                 },
                 "required": ["from", "to", "amount"]
-            }
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": true }
         },
         {
             "name": "list_triggers",
@@ -603,7 +610,7 @@ fn tools() -> Value {
                     "active_only": { "type": "boolean", "description": "Default true." }
                 }
             },
-            "annotations": { "readOnlyHint": true }
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true }
         },
         {
             "name": "cancel_trigger",
@@ -614,7 +621,8 @@ fn tools() -> Value {
                     "id": { "type": "string", "description": "Trigger id (trg_...)." }
                 },
                 "required": ["id"]
-            }
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false }
         },
         {
             "name": "change_budget",
@@ -648,7 +656,8 @@ fn tools() -> Value {
                     "max_daily_loss_sol": { "type": "string", "description": "Daily realized-loss circuit breaker in SOL (e.g. \"0.25\", or \"0\" to disable)." }
                 },
                 "required": ["reason"]
-            }
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false }
         }
     ])
 }
@@ -666,7 +675,60 @@ mod tests {
             assert!(tool["name"].is_string());
             assert!(tool["description"].as_str().unwrap().len() > 10);
             assert_eq!(tool["inputSchema"]["type"], "object");
+            let ann = tool["annotations"]
+                .as_object()
+                .unwrap_or_else(|| panic!("missing annotations on {}", tool["name"]));
+            assert!(
+                ann.get("readOnlyHint").and_then(|v| v.as_bool()).is_some(),
+                "missing readOnlyHint on {}",
+                tool["name"]
+            );
+            assert!(
+                ann.get("destructiveHint").and_then(|v| v.as_bool()).is_some(),
+                "missing destructiveHint on {}",
+                tool["name"]
+            );
         }
+
+        let by_name = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == n)
+                .unwrap_or_else(|| panic!("missing tool {n}"))
+        };
+        for ro in [
+            "wallet_status",
+            "balances",
+            "history",
+            "invoice_status",
+            "verify",
+            "quote",
+            "portfolio",
+            "list_triggers",
+        ] {
+            let ann = &by_name(ro)["annotations"];
+            assert_eq!(ann["readOnlyHint"], true, "{ro}");
+            assert_eq!(ann["destructiveHint"], false, "{ro}");
+            assert_eq!(ann["idempotentHint"], true, "{ro}");
+        }
+        for fm in ["send", "swap", "stake", "unstake", "pay_invoice", "pay_x402"] {
+            let ann = &by_name(fm)["annotations"];
+            assert_eq!(ann["readOnlyHint"], false, "{fm}");
+            assert_eq!(ann["destructiveHint"], true, "{fm}");
+            assert_eq!(ann["openWorldHint"], true, "{fm}");
+        }
+        for sm in [
+            "operation",
+            "create_invoice",
+            "create_trigger",
+            "cancel_trigger",
+            "change_budget",
+        ] {
+            let ann = &by_name(sm)["annotations"];
+            assert_eq!(ann["readOnlyHint"], false, "{sm}");
+            assert_eq!(ann["destructiveHint"], false, "{sm}");
+        }
+        assert!(by_name("create_trigger")["inputSchema"]["properties"]["dry_run"].is_object());
     }
 
     #[test]

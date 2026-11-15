@@ -1879,6 +1879,7 @@ impl AgentWallet {
         stop_loss_pct: Option<f64>,
         trailing_stop_bps: Option<u16>,
         tag: Option<String>,
+        dry_run: bool,
     ) -> anyhow::Result<Value> {
         let input = tx::resolve_asset(&self.rpc, from, &self.cluster).await?;
         let output = tx::resolve_asset(&self.rpc, to, &self.cluster).await?;
@@ -1932,13 +1933,24 @@ impl AgentWallet {
         }
 
         crate::trading::validate_trigger_rates(tp, sl, trailing_stop_bps)?;
+
+        let effective_slippage = slippage_bps.unwrap_or(50);
+        let budget = self.budget().await?;
+        let policy_reasons =
+            preflight_trigger_policy(&budget, &output, &self.cluster, effective_slippage);
+        let policy_ok = policy_reasons.is_empty();
+
         let now = chrono::Utc::now().to_rfc3339();
         let record = crate::store::TriggerRecord {
-            id: format!("trg_{}", uuid::Uuid::new_v4().simple()),
+            id: if dry_run {
+                "trg_dry_run_preview".to_string()
+            } else {
+                format!("trg_{}", uuid::Uuid::new_v4().simple())
+            },
             from_token: from.trim().to_string(),
             to_token: to.trim().to_string(),
             amount: amount.trim().to_string(),
-            slippage_bps: slippage_bps.unwrap_or(50),
+            slippage_bps: effective_slippage,
             take_profit_rate: tp,
             stop_loss_rate: sl,
             trailing_stop_bps,
@@ -1954,11 +1966,24 @@ impl AgentWallet {
             created_at: now.clone(),
             updated_at: now,
         };
+        let pair = format!("{} -> {}", input.symbol, output.symbol);
+        if dry_run {
+            return Ok(json!({
+                "dry_run": true,
+                "trigger_preview": record,
+                "reference_rate": reference_rate,
+                "pair": pair,
+                "policy_ok": policy_ok,
+                "policy_reasons": policy_reasons,
+            }));
+        }
         self.store.put_trigger(&record).await?;
         Ok(json!({
             "trigger": record,
             "reference_rate": reference_rate,
-            "pair": format!("{} -> {}", input.symbol, output.symbol),
+            "pair": pair,
+            "policy_ok": policy_ok,
+            "policy_reasons": policy_reasons,
         }))
     }
 
@@ -2497,6 +2522,32 @@ pub fn budget_view(
     })
 }
 
+/// Preflight-check trigger execution parameters against the wallet's swap policy.
+fn preflight_trigger_policy(
+    budget: &Budget,
+    output: &Asset,
+    cluster: &str,
+    slippage_bps: u16,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if slippage_bps > budget.max_slippage_bps {
+        reasons.push(format!(
+            "slippage {slippage_bps} bps exceeds the agent limit of {} bps",
+            budget.max_slippage_bps
+        ));
+    }
+    if budget.require_allowed_tokens
+        && !crate::trading::token_is_allowed(&budget.allowed_tokens, output, cluster)
+    {
+        reasons.push(format!(
+            "output token {} ({}) is not in allowed_tokens",
+            output.symbol,
+            output.mint_or_wsol()
+        ));
+    }
+    reasons
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2625,5 +2676,124 @@ mod tests {
         assert!(validate_request_id("pay-2026-09-26").is_ok());
         assert!(validate_request_id("x").is_err());
         assert!(validate_request_id("has space").is_err());
+    }
+
+    fn mock_mint_rpc(decimals: u8) -> RpcClient {
+        use base64::Engine as _;
+        let mut mint_data = vec![0u8; 82];
+        mint_data[44] = decimals;
+        mint_data[45] = 1; // is_initialized = true
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&mint_data);
+        let account_json = json!({
+            "context": { "slot": 1 },
+            "value": {
+                "data": [encoded, "base64"],
+                "executable": false,
+                "lamports": 1_461_600,
+                "owner": spl_token::id().to_string(),
+                "rentEpoch": 0,
+                "space": 82
+            }
+        });
+        RpcClient::new_mock_with_mocks(
+            "http://mock.local".into(),
+            std::collections::HashMap::from([(
+                solana_client::rpc_request::RpcRequest::GetAccountInfo,
+                account_json,
+            )]),
+        )
+    }
+
+    async fn test_wallet(rpc: RpcClient) -> (AgentWallet, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "manus-agent-engine-test-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = Store::open(&path).await.unwrap();
+        let wallet = AgentWallet::new(
+            rpc,
+            Keypair::new(),
+            "devnet".to_string(),
+            store,
+            Arc::new(crate::approval::NoApprover),
+            Gbrain::disabled(),
+        );
+        (wallet, path)
+    }
+
+    #[tokio::test]
+    async fn create_trigger_dry_run_previews_and_persists_nothing() {
+        let (wallet, path) = test_wallet(mock_mint_rpc(6)).await;
+        let res = wallet
+            .create_trigger(
+                "SOL",
+                "USDC",
+                "0.1",
+                Some(50),
+                Some(150.0),
+                Some(90.0),
+                None,
+                None,
+                None,
+                Some("TEST".into()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res["dry_run"], true);
+        assert_eq!(res["policy_ok"], true);
+        assert_eq!(res["policy_reasons"], json!([]));
+        assert_eq!(res["trigger_preview"]["from_token"], "SOL");
+        assert_eq!(res["trigger_preview"]["to_token"], "USDC");
+        assert_eq!(res["trigger_preview"]["slippage_bps"], 50);
+        assert_eq!(res["trigger_preview"]["take_profit_rate"], 150.0);
+        assert_eq!(res["trigger_preview"]["stop_loss_rate"], 90.0);
+        assert_eq!(res["trigger_preview"]["tag"], "TEST");
+        assert!(
+            wallet.store.list_triggers(false).await.unwrap().is_empty(),
+            "dry_run must not persist triggers to SQLite"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn create_trigger_dry_run_flags_policy_violations() {
+        let (wallet, path) = test_wallet(mock_mint_rpc(6)).await;
+        let mut budget = wallet.budget().await.unwrap();
+        budget.max_slippage_bps = 50;
+        budget.require_allowed_tokens = true;
+        budget.allowed_tokens = vec!["SOL".to_string()];
+        wallet.store.save_budget(&budget).await.unwrap();
+
+        let random_mint = Pubkey::new_unique().to_string();
+        let res = wallet
+            .create_trigger(
+                "SOL",
+                &random_mint,
+                "0.1",
+                Some(250),
+                Some(150.0),
+                Some(90.0),
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res["dry_run"], true);
+        assert_eq!(res["policy_ok"], false);
+        let reasons = res["policy_reasons"].as_array().unwrap();
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons[0].as_str().unwrap().contains("slippage 250 bps"));
+        assert!(reasons[1].as_str().unwrap().contains("allowed_tokens"));
+        assert!(
+            wallet.store.list_triggers(false).await.unwrap().is_empty(),
+            "dry_run must not persist triggers to SQLite"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

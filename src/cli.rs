@@ -148,6 +148,8 @@ pub enum TriggerAction {
         trailing_stop_bps: Option<u16>,
         #[arg(long)]
         tag: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List active (or --all) triggers
     List {
@@ -339,6 +341,7 @@ pub async fn run(name: &str, action: &AgentAction) -> anyhow::Result<()> {
                     stop_loss_pct,
                     trailing_stop_bps,
                     tag,
+                    dry_run,
                 } => print(
                     wallet
                         .create_trigger(
@@ -352,6 +355,7 @@ pub async fn run(name: &str, action: &AgentAction) -> anyhow::Result<()> {
                             *stop_loss_pct,
                             *trailing_stop_bps,
                             tag.clone(),
+                            *dry_run,
                         )
                         .await?,
                 ),
